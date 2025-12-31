@@ -670,3 +670,13 @@ FlowSchem provides engineers with a simple DSL for creating professional schemat
 - **Output:** Clean SVG with orthogonal wire routing, exportable to PDF/PNG
 
 The tool solves the specific problem of creating neat, grid-aligned system diagrams that existing tools like Mermaid cannot produce.
+
+---
+
+## Demo
+
+```sh
+cd /media/logic/USamsung/ORCA_flow
+python3 -m http.server 8000
+# Open browser to http://localhost:8000
+```

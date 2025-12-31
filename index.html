@@ -1,35 +1,29 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FlowSchem - Schematic Diagram Generator</title>
-    
+
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+
     <!-- Stylesheet -->
-    <link rel="stylesheet" href="flowschem.css">
+    <link rel="stylesheet" href="css/flowschem.css">
 </head>
+
 <body>
     <!-- Banner -->
     <header class="banner">
         <div class="banner-logo">
-            <svg class="logo-icon" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg">
-                <!-- Simplified flow diagram icon -->
-                <rect x="5" y="10" width="25" height="15" rx="3" fill="none" stroke="#3399f3" stroke-width="2"/>
-                <rect x="50" y="10" width="25" height="15" rx="3" fill="none" stroke="#3399f3" stroke-width="2"/>
-                <rect x="27" y="45" width="25" height="15" rx="3" fill="none" stroke="#ff0083" stroke-width="2"/>
-                <path d="M17 25 L17 35 L40 35 L40 45" stroke="#3399f3" stroke-width="2" fill="none"/>
-                <path d="M62 25 L62 35 L40 35" stroke="#3399f3" stroke-width="2" fill="none"/>
-                <circle cx="40" cy="35" r="3" fill="#0CFFE1"/>
-                <polygon points="40,45 37,40 43,40" fill="#3399f3"/>
-            </svg>
+            <img src="assets/logo.png" alt="ORCA Flow Logo" class="logo-icon">
         </div>
         <div class="banner-text">
-            <h1>FLOWSCHEM</h1>
+            <h1>ORCA FLOW</h1>
             <h2>SCHEMATIC DIAGRAM GENERATOR</h2>
         </div>
     </header>
@@ -45,11 +39,7 @@
                     <span class="collapse-icon">▼</span>
                 </div>
                 <div id="style-content" class="section-content">
-                    <textarea 
-                        id="style-input" 
-                        class="code-input" 
-                        spellcheck="false"
-                        placeholder="@style
+                    <textarea id="style-input" class="code-input" spellcheck="false" placeholder="@style
 section-radius: 6
 node-radius: 4
 node-border: 2
@@ -82,11 +72,7 @@ node-uniform: true"></textarea>
                     <span class="collapse-icon">▼</span>
                 </div>
                 <div id="layout-content" class="section-content">
-                    <textarea 
-                        id="layout-input" 
-                        class="code-input" 
-                        spellcheck="false"
-                        placeholder="@layout [Section1][Section2]/[Section3]
+                    <textarea id="layout-input" class="code-input" spellcheck="false" placeholder="@layout [Section1][Section2]/[Section3]
 
 Examples:
 [A][B]        → Horizontal
@@ -103,11 +89,7 @@ Examples:
                     <span class="collapse-icon">▼</span>
                 </div>
                 <div id="nodes-content" class="section-content">
-                    <textarea 
-                        id="nodes-input" 
-                        class="code-input" 
-                        spellcheck="false"
-                        placeholder="@nodes
+                    <textarea id="nodes-input" class="code-input" spellcheck="false" placeholder="@nodes
 section-1
 NodeA/hint text > NodeB
 NodeA <> NodeC/description
@@ -158,14 +140,20 @@ Symbols:
                 <div id="preview-placeholder" class="preview-placeholder">
                     <div class="placeholder-content">
                         <svg class="placeholder-icon" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                            <rect x="10" y="15" width="30" height="20" rx="3" fill="none" stroke="#3399f3" stroke-width="2" opacity="0.5"/>
-                            <rect x="60" y="15" width="30" height="20" rx="3" fill="none" stroke="#3399f3" stroke-width="2" opacity="0.5"/>
-                            <rect x="35" y="55" width="30" height="20" rx="3" fill="none" stroke="#ff0083" stroke-width="2" opacity="0.5"/>
-                            <path d="M25 35 L25 45 L50 45 L50 55" stroke="#3399f3" stroke-width="2" fill="none" opacity="0.5"/>
-                            <path d="M75 35 L75 45 L50 45" stroke="#3399f3" stroke-width="2" fill="none" opacity="0.5"/>
-                            <circle cx="50" cy="45" r="3" fill="#0CFFE1" opacity="0.5"/>
+                            <rect x="10" y="15" width="30" height="20" rx="3" fill="none" stroke="#3399f3"
+                                stroke-width="2" opacity="0.5" />
+                            <rect x="60" y="15" width="30" height="20" rx="3" fill="none" stroke="#3399f3"
+                                stroke-width="2" opacity="0.5" />
+                            <rect x="35" y="55" width="30" height="20" rx="3" fill="none" stroke="#ff0083"
+                                stroke-width="2" opacity="0.5" />
+                            <path d="M25 35 L25 45 L50 45 L50 55" stroke="#3399f3" stroke-width="2" fill="none"
+                                opacity="0.5" />
+                            <path d="M75 35 L75 45 L50 45" stroke="#3399f3" stroke-width="2" fill="none"
+                                opacity="0.5" />
+                            <circle cx="50" cy="45" r="3" fill="#0CFFE1" opacity="0.5" />
                         </svg>
-                        <p class="placeholder-text">Enter your diagram definition and click<br><strong>Generate Preview</strong> to see the result</p>
+                        <p class="placeholder-text">Enter your diagram definition and click<br><strong>Generate
+                                Preview</strong> to see the result</p>
                     </div>
                 </div>
                 <div id="preview-canvas" class="preview-canvas" style="display: none;">
@@ -198,6 +186,7 @@ Symbols:
     </div>
 
     <!-- JavaScript -->
-    <script src="flowschem.js"></script>
+    <script src="js/flowschem.js"></script>
 </body>
+
 </html>
