@@ -1,5 +1,24 @@
 # ORCA_flow: Schematic-Style System Diagram Generator
 
+## Quick Start
+
+```sh
+# Run locally with Python
+cd ORCA_flow
+python3 -m http.server 8000
+# Open browser to http://localhost:8000
+```
+
+**Keyboard Shortcuts:**
+
+- `Ctrl+Enter` - Generate preview
+- `Ctrl+Wheel` - Zoom in/out
+- `Ctrl+Shift+R` - Hard refresh (after code changes)
+
+**Zoom Controls:** Use the toolbar buttons (−, ⊡, %, +, 1:1) to zoom out, fit to window, zoom in, or reset to 100%.
+
+---
+
 ## Project Overview
 
 ORCA flow is a web-based tool for generating clean, schematic-style system diagrams with orthogonal (horizontal/vertical) wire routing. It addresses limitations in existing tools like Mermaid, which use force-directed layouts that produce messy, non-uniform diagrams unsuitable for engineering documentation.
@@ -33,7 +52,7 @@ Two-panel web interface:
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ ┌─────────────────────────┐ ┌─────────────────────────────────────────┐ │
-│ │         STYLE           │ │ [Generate] [PDF] [PNG] [Export .flow]  │ │
+│ │         STYLE           │ │ [Generate] [PDF] [PNG] [.flow] [−][⊡][+]│ │
 │ ├─────────────────────────┤ ├─────────────────────────────────────────┤ │
 │ │         LAYOUT          │ │                                         │ │
 │ ├─────────────────────────┤ │                                         │ │
@@ -48,13 +67,16 @@ Two-panel web interface:
 
 Layout definition using project's own syntax:
 ```
-[[Style]/[Layout]/[Nodes]][[[Generate preview][Export pdf][Export png][Export flow layout txt]]/[Preview]]
+[[Style]/[Layout]/[Nodes]][[[Generate][PDF][PNG][.flow][Zoom controls]]/[Preview]]
 ```
 
 ### Features
-- Left panel: Three input sections for Style, Layout, and Nodes
-- Right panel: Live preview with export buttons
+
+- Left panel: Three collapsible input sections for Style, Layout, and Nodes
+- Right panel: Live preview with export buttons and zoom controls
 - Export formats: PDF, PNG, and `.flow` source file
+- Zoom controls: Fit to window (auto on generate), zoom in/out, reset to 100%
+- Keyboard shortcuts: `Ctrl+Enter` to generate, `Ctrl+Wheel` to zoom
 - Distribution: Hosted online and downloadable from GitHub for offline use
 
 ---
@@ -86,24 +108,24 @@ The `@style` block defines visual parameters using `key: value` syntax.
 
 ### Available Parameters
 
-| Parameter | Description | Example |
+| Parameter | Description | Default |
 |-----------|-------------|---------|
-| `section-radius` | Corner radius for segment boxes | `6` |
-| `node-radius` | Corner radius for node boxes | `4` |
+| `section-radius` | Corner radius for segment boxes | `8` |
+| `node-radius` | Corner radius for node boxes | `6` |
 | `node-border` | Border thickness for nodes | `2` |
 | `line-thickness` | Connection line thickness | `2` |
-| `font` | Primary font (Google Fonts) | `Inter` |
+| `font` | Primary font (Google Fonts) | `Roboto Mono` |
 | `font-weight` | Primary font weight | `500` |
 | `font-size` | Primary font size in px | `14` |
-| `hint-font` | Hint/subtitle font | `Inter` |
+| `hint-font` | Hint/subtitle font | `Roboto Mono` |
 | `hint-weight` | Hint font weight | `300` |
 | `hint-size` | Hint font size in px | `11` |
-| `section-padding` | Segment padding (top right bottom left) | `16 12 16 12` |
-| `node-padding` | Node padding (top right bottom left) | `8 12 8 12` |
-| `flow` | Direction of data flow | `down` (or `left`, `right`) |
-| `uppercase` | Convert text to uppercase | `true` or `false` |
-| `theme` | Colour theme preset | `default` (see Theming section) |
-| `line-theme` | Enable line style variations for accessibility | `true` or `false` |
+| `section-padding` | Segment padding (top right bottom left) | `20 16 20 16` |
+| `node-padding` | Node padding (top right bottom left) | `10 14 10 14` |
+| `flow` | Direction of data flow | `down` |
+| `uppercase` | Convert text to uppercase | `true` |
+| `theme` | Colour theme preset | `engineering` |
+| `line-theme` | Enable line style variations for accessibility | `true` |
 
 ### Export and Page Size Parameters
 
@@ -117,12 +139,12 @@ The `@style` block defines visual parameters using `key: value` syntax.
 
 ### Node Size Parameters
 
-| Parameter | Description | Example |
+| Parameter | Description | Default |
 |-----------|-------------|---------|
 | `node-min-width` | Minimum node width in px | `120` |
 | `node-min-height` | Minimum node height in px | `60` |
-| `node-max-width` | Maximum node width in px (0 = no limit) | `200` |
-| `node-uniform` | Force all nodes to same size | `true` or `false` |
+| `node-max-width` | Maximum node width in px (0 = no limit) | `0` |
+| `node-uniform` | Force all nodes to same size | `true` |
 
 **Node sizing behaviour:**
 - Nodes expand automatically to fit content (heading + hint text)
@@ -134,8 +156,8 @@ The `@style` block defines visual parameters using `key: value` syntax.
 
 ```
 @style
-section-radius: 6
-node-radius: 4
+section-radius: 8
+node-radius: 6
 node-border: 2
 line-thickness: 2
 font: Roboto Mono
@@ -144,12 +166,12 @@ font-size: 14
 hint-font: Roboto Mono
 hint-weight: 300
 hint-size: 11
-section-padding: 16 12 16 12
-node-padding: 8 12 8 12
+section-padding: 20 16 20 16
+node-padding: 10 14 10 14
 flow: down
 uppercase: true
-theme: default
-line-theme: false
+theme: engineering
+line-theme: true
 page-size: A4
 page-orientation: landscape
 page-margin: 10 10 10 10
@@ -673,10 +695,64 @@ The tool solves the specific problem of creating neat, grid-aligned system diagr
 
 ---
 
-## Demo
+## Demo Example
 
-```sh
-cd /media/logic/USamsung/ORCA_flow
-python3 -m http.server 8000
-# Open browser to http://localhost:8000
+Copy and paste this into the app to test all features:
+
+```flow
+@style
+section-radius: 8
+node-radius: 6
+node-border: 2
+line-thickness: 2
+font: Roboto Mono
+font-weight: 500
+font-size: 14
+hint-font: Roboto Mono
+hint-weight: 300
+hint-size: 11
+section-padding: 20 16 20 16
+node-padding: 10 14 10 14
+flow: down
+uppercase: true
+theme: engineering
+line-theme: true
+
+@layout [USV[sensors][control]][ROV[rov_sensors][rov_control]]/[ground]
+
+@nodes
+sensors-1
+Jetson/Nvidia Orin <> Teensy/PJRC 4.1
+Jetson <> Xbee/Digi XBee3
+
+sensors-2
+Teensy > GPS/u-blox NEO-M8N, IMU/BNO085, Pressure/MS5611
+Xbee <> Ground Station
+
+control-1
+Jetson > ODrive/v3.6
+
+control-2
+ODrive > Thruster L, Thruster R
+
+rov_sensors-1
+RPi/Raspberry Pi 4B <> Teensy/PJRC 4.1
+
+rov_sensors-2
+Teensy > Depth/Bar30, Leak/Sensor, Temp/DS18B20
+
+rov_control-1
+RPi > ESC Array/4x BlueRobotics
+
+rov_control-2
+ESC Array > T1, T2, T3, T4
+
+ground-1
+Ground Station/Desktop PC > Dashboard/React, Logger/SQLite, Map/Leaflet
+Xbee <> Ground Station
+
+# Section-level connections
+overview-1
+USV <> ROV
+USV <> ground
 ```

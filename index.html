@@ -40,8 +40,8 @@
                 </div>
                 <div id="style-content" class="section-content">
                     <textarea id="style-input" class="code-input" spellcheck="false" placeholder="@style
-section-radius: 6
-node-radius: 4
+section-radius: 8
+node-radius: 6
 node-border: 2
 line-thickness: 2
 font: Roboto Mono
@@ -50,12 +50,12 @@ font-size: 14
 hint-font: Roboto Mono
 hint-weight: 300
 hint-size: 11
-section-padding: 16 12 16 12
-node-padding: 8 12 8 12
+section-padding: 20 16 20 16
+node-padding: 10 14 10 14
 flow: down
 uppercase: true
-theme: default
-line-theme: false
+theme: engineering
+line-theme: true
 page-size: A4
 page-orientation: landscape
 page-margin: 10 10 10 10
@@ -133,6 +133,13 @@ Symbols:
                     Load .flow
                 </button>
                 <input type="file" id="file-input" accept=".flow,.txt" style="display: none;">
+                <div class="zoom-controls">
+                    <button id="btn-zoom-out" class="btn btn-zoom" title="Zoom Out">−</button>
+                    <button id="btn-zoom-fit" class="btn btn-zoom" title="Fit to Window">⊡</button>
+                    <span id="zoom-level" class="zoom-level">100%</span>
+                    <button id="btn-zoom-in" class="btn btn-zoom" title="Zoom In">+</button>
+                    <button id="btn-zoom-reset" class="btn btn-zoom" title="Reset to 100%">1:1</button>
+                </div>
             </div>
 
             <!-- Preview Container -->

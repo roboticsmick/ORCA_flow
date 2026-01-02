@@ -18,7 +18,13 @@ const AppState = {
     layoutTree: null,
     nodes: [],
     connections: [],
-    diagramGenerated: false
+    diagramGenerated: false,
+    zoom: {
+        level: 1,
+        minLevel: 0.1,
+        maxLevel: 3,
+        step: 0.1
+    }
 };
 
 // =============================================================================
@@ -55,7 +61,15 @@ const Elements = {
     modalOk: document.getElementById('modal-ok'),
     
     // Section headers for collapse functionality
-    sectionHeaders: document.querySelectorAll('.section-header')
+    sectionHeaders: document.querySelectorAll('.section-header'),
+
+    // Zoom controls
+    btnZoomIn: document.getElementById('btn-zoom-in'),
+    btnZoomOut: document.getElementById('btn-zoom-out'),
+    btnZoomFit: document.getElementById('btn-zoom-fit'),
+    btnZoomReset: document.getElementById('btn-zoom-reset'),
+    zoomLevel: document.getElementById('zoom-level'),
+    previewContainer: document.querySelector('.preview-container')
 };
 
 // =============================================================================
@@ -63,8 +77,8 @@ const Elements = {
 // =============================================================================
 
 const DefaultStyle = {
-    'section-radius': 6,
-    'node-radius': 4,
+    'section-radius': 8,
+    'node-radius': 6,
     'node-border': 2,
     'line-thickness': 2,
     'font': 'Roboto Mono',
@@ -73,12 +87,12 @@ const DefaultStyle = {
     'hint-font': 'Roboto Mono',
     'hint-weight': 300,
     'hint-size': 11,
-    'section-padding': '16 12 16 12',
-    'node-padding': '8 12 8 12',
+    'section-padding': '20 16 20 16',
+    'node-padding': '10 14 10 14',
     'flow': 'down',
     'uppercase': true,
-    'theme': 'default',
-    'line-theme': false,
+    'theme': 'engineering',
+    'line-theme': true,
     'page-size': 'A4',
     'page-orientation': 'landscape',
     'page-margin': '10 10 10 10',
@@ -598,23 +612,26 @@ function renderDiagram(style, layout, nodesData) {
     svg += `<defs>
         <style>
             @import url('https://fonts.googleapis.com/css2?family=${style.font.replace(' ', '+')}:wght@300;400;500;600&display=swap');
-            .node-text { 
-                font-family: '${style.font}', sans-serif; 
-                font-weight: ${style['font-weight']}; 
-                font-size: ${style['font-size']}px; 
+            .node-text {
+                font-family: '${style.font}', sans-serif;
+                font-weight: ${style['font-weight']};
+                font-size: ${style['font-size']}px;
                 fill: #ffffff;
+                text-anchor: middle;
             }
-            .hint-text { 
-                font-family: '${style['hint-font']}', sans-serif; 
-                font-weight: ${style['hint-weight']}; 
-                font-size: ${style['hint-size']}px; 
+            .hint-text {
+                font-family: '${style['hint-font']}', sans-serif;
+                font-weight: ${style['hint-weight']};
+                font-size: ${style['hint-size']}px;
                 fill: #aabbcc;
+                text-anchor: middle;
             }
             .section-label {
                 font-family: '${style.font}', sans-serif;
                 font-weight: 600;
                 font-size: ${style['font-size'] + 2}px;
                 fill: #ffffff;
+                text-anchor: middle;
             }
         </style>
     </defs>`;
@@ -670,10 +687,11 @@ function renderLayoutNode(node, x, y, width, height, style, themeColors, colorIn
             rx="${style['section-radius']}" ry="${style['section-radius']}"
             fill="rgba(0,0,44,0.5)" stroke="${color}" stroke-width="2"/>`;
         
-        // Draw segment label
+        // Draw segment label (centered horizontally in the box)
         if (node.name) {
             const labelText = style.uppercase ? node.name.toUpperCase() : node.name;
-            svg += `<text x="${x + padding}" y="${y + 20}" class="section-label" fill="${color}">
+            const centerX = x + width / 2;
+            svg += `<text x="${centerX}" y="${y + 20}" class="section-label" fill="${color}">
                 ${labelText}
             </text>`;
         }
@@ -943,7 +961,10 @@ function generatePreview() {
             Elements.btnExportPng.disabled = false;
             
             AppState.diagramGenerated = true;
-            
+
+            // Fit diagram to window by default
+            zoomFit();
+
             const nodeCount = nodesData.nodes.length;
             const connCount = nodesData.connections.length;
             setStatus('Preview generated', 'success', `${nodeCount} nodes, ${connCount} connections`);
@@ -959,7 +980,105 @@ function generatePreview() {
 }
 
 // =============================================================================
-// 11. EVENT LISTENERS
+// 11. ZOOM FUNCTIONS
+// =============================================================================
+
+/**
+ * Updates the zoom level display.
+ */
+function updateZoomDisplay() {
+    Elements.zoomLevel.textContent = Math.round(AppState.zoom.level * 100) + '%';
+}
+
+/**
+ * Applies the current zoom level to the SVG.
+ */
+function applyZoom() {
+    const svg = Elements.previewCanvas.querySelector('svg');
+    if (!svg) return;
+
+    svg.style.transform = `scale(${AppState.zoom.level})`;
+    svg.style.transformOrigin = 'top left';
+    updateZoomDisplay();
+}
+
+/**
+ * Zooms in by one step.
+ */
+function zoomIn() {
+    if (AppState.zoom.level < AppState.zoom.maxLevel) {
+        AppState.zoom.level = Math.min(
+            AppState.zoom.maxLevel,
+            Math.round((AppState.zoom.level + AppState.zoom.step) * 10) / 10
+        );
+        applyZoom();
+    }
+}
+
+/**
+ * Zooms out by one step.
+ */
+function zoomOut() {
+    if (AppState.zoom.level > AppState.zoom.minLevel) {
+        AppState.zoom.level = Math.max(
+            AppState.zoom.minLevel,
+            Math.round((AppState.zoom.level - AppState.zoom.step) * 10) / 10
+        );
+        applyZoom();
+    }
+}
+
+/**
+ * Resets zoom to 100%.
+ */
+function zoomReset() {
+    AppState.zoom.level = 1;
+    applyZoom();
+}
+
+/**
+ * Fits the diagram to the preview window.
+ */
+function zoomFit() {
+    const svg = Elements.previewCanvas.querySelector('svg');
+    if (!svg) return;
+
+    // Reset transform temporarily to get actual dimensions
+    svg.style.transform = 'none';
+
+    const container = Elements.previewContainer;
+    const containerWidth = container.clientWidth - 24; // Account for padding
+    const containerHeight = container.clientHeight - 24;
+
+    const svgWidth = parseFloat(svg.getAttribute('width')) || svg.getBoundingClientRect().width;
+    const svgHeight = parseFloat(svg.getAttribute('height')) || svg.getBoundingClientRect().height;
+
+    if (svgWidth === 0 || svgHeight === 0) return;
+
+    // Calculate scale to fit
+    const scaleX = containerWidth / svgWidth;
+    const scaleY = containerHeight / svgHeight;
+    const scale = Math.min(scaleX, scaleY, AppState.zoom.maxLevel);
+
+    AppState.zoom.level = Math.max(AppState.zoom.minLevel, Math.round(scale * 100) / 100);
+    applyZoom();
+}
+
+/**
+ * Sets zoom to a specific level.
+ *
+ * @param {number} level - The zoom level (1 = 100%).
+ */
+function setZoom(level) {
+    AppState.zoom.level = Math.max(
+        AppState.zoom.minLevel,
+        Math.min(AppState.zoom.maxLevel, level)
+    );
+    applyZoom();
+}
+
+// =============================================================================
+// 12. EVENT LISTENERS
 // =============================================================================
 
 // Section collapse functionality
@@ -991,6 +1110,24 @@ Elements.fileInput.addEventListener('change', (e) => {
     }
 });
 
+// Zoom control handlers
+Elements.btnZoomIn.addEventListener('click', zoomIn);
+Elements.btnZoomOut.addEventListener('click', zoomOut);
+Elements.btnZoomFit.addEventListener('click', zoomFit);
+Elements.btnZoomReset.addEventListener('click', zoomReset);
+
+// Mouse wheel zoom on preview
+Elements.previewCanvas.addEventListener('wheel', (e) => {
+    if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        if (e.deltaY < 0) {
+            zoomIn();
+        } else {
+            zoomOut();
+        }
+    }
+}, { passive: false });
+
 // Modal handlers
 Elements.modalClose.addEventListener('click', hideModal);
 Elements.modalOk.addEventListener('click', hideModal);
@@ -1015,7 +1152,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 // =============================================================================
-// 12. INITIALISATION
+// 13. INITIALISATION
 // =============================================================================
 
-setStatus('Ready', 'info', 'Press Ctrl+Enter to generate');
+setStatus('Ready', 'info', 'Ctrl+Enter to generate | Ctrl+Wheel to zoom');

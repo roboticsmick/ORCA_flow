@@ -234,6 +234,11 @@ body {
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
+/* Style input needs more height to show all default parameters */
+#style-input {
+    min-height: 290px;
+}
+
 .code-input:focus {
     border-color: var(--marine-blue);
     box-shadow: 0 0 0 2px var(--marine-blue-transparent);
@@ -354,6 +359,48 @@ body {
 .btn:disabled:hover {
     background-color: transparent;
     box-shadow: none;
+}
+
+/* Zoom Controls */
+.zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    margin-left: auto;
+    padding-left: var(--spacing-md);
+    border-left: 1px solid var(--border-subtle);
+}
+
+.btn-zoom {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1rem;
+    font-weight: 600;
+    background-color: transparent;
+    color: var(--marine-blue);
+    border: 1px solid var(--marine-blue);
+}
+
+.btn-zoom:hover {
+    background-color: var(--marine-blue-transparent);
+}
+
+.btn-zoom:active {
+    background-color: var(--marine-blue);
+    color: var(--text-color);
+}
+
+.zoom-level {
+    min-width: 50px;
+    text-align: center;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    font-family: 'Roboto Mono', monospace;
 }
 
 /* Preview Container */
