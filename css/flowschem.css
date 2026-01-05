@@ -408,7 +408,7 @@ body {
     flex: 1;
     position: relative;
     overflow: hidden;
-    background-color: var(--charcoal);
+    background-color: #ffffff;
     margin: var(--spacing-sm);
     margin-bottom: 0;
     border-radius: var(--radius-sm);
@@ -428,7 +428,7 @@ body {
 
 .placeholder-content {
     text-align: center;
-    color: var(--text-muted);
+    color: #666666;
 }
 
 .placeholder-icon {

@@ -141,6 +141,8 @@ python main.py input.csv \
 
 **Format:**
 
+Python example:
+
 ```py
 ## @brief Brief description of the class/function.
 #
@@ -160,92 +162,3 @@ class MyClass:
 * Include `@return` for non-void functions
 * Add `@pre` tags matching code assertions (NASA principle compliance)
 * Include `@section usage` with working examples for complex functions
-
-## V. PDF to Markdown Transposition Guidelines
-
-**Purpose:** Convert academic papers to clean markdown with Python code blocks for equations, enabling easy AI reference and deployment.
-
-**Process Overview:**
-
-When transposing a PDF paper to markdown, follow these steps to create a refined summary with deployable equations:
-
-### V.1 Content Selection
-
-* **Include:** Paper title, abstract, introduction, methodology sections, and all mathematical equations/formulas
-* **Exclude:** Bibliography/References, page formatting, header/footer content, copyright notices, author affiliations
-* **Preserve:** Section numbering, subsection hierarchy, all mathematical notation and relationships
-
-### V.2 Equation Formatting
-
-**Key Principle:** Convert all mathematical equations to Python code blocks with explicit variable names instead of mathematical notation.
-
-**Rules:**
-
-1. **Replace abstract symbols with explicit variable names:**
-   - Instead of using single letters like `f`, `v₀`, `k`, use descriptive names: `focal_length`, `principal_point_v`, `radial_distortion_coeff`
-   - Use snake_case naming convention for all variables
-   - Document the physical meaning of each variable in comments
-
-2. **Use Python code blocks for ALL equations:**
-   - Do NOT use KaTeX/LaTeX markdown formulas ($$...$$ or $...$)
-   - Use `py` language identifier in code blocks
-   - Include Doxygen-formatted comments explaining the equation
-
-3. **Equation Code Block Template:**
-
-```py
-## @brief Brief description of what this equation/system represents.
-#
-#  Detailed explanation of the mathematical concept and its role
-#  in the overall algorithm or model.
-#
-#  @param variable_name Description of the variable and its physical meaning
-#  @return Description of what is calculated
-#
-# Example: For imaging model with focal length f, principal point v₀, and intrinsics k
-focal_length = f              # in pixels
-principal_point_v = v_0        # pixel coordinate of principal point
-radial_distortion_coeff = k    # first-order radial distortion coefficient
-```
-
-4. **System of equations:**
-   - Use descriptive variable names and clear assignment statements
-   - Add comments explaining each line's physical meaning
-   - Include cross-references to equation numbers from the paper
-
-5. **Vector and matrix operations:**
-   - Use numpy-style notation in comments
-   - Create clear variable assignments for each matrix/vector
-   - Include shape information (e.g., # 3x4 projection matrix)
-
-### V.3 Structure and Organization
-
-1. **Maintain original section headers** - preserve the paper's section numbering and hierarchy
-2. **Add code blocks for equations** - immediately after the text that references them
-3. **Include variable definitions** - define all symbols before their first use in code blocks
-4. **Cross-reference equations** - reference original paper equation numbers in code comments
-5. **Tables** - preserve as markdown tables with python values where applicable
-
-### V.4 Quality Assurance
-
-* **Equation Verification:** After transposition, verify each equation against the PDF:
-  - Check all coefficients and signs are correct
-  - Ensure matrix dimensions match
-  - Verify variable names are consistent throughout the document
-  - Test code blocks for Python syntax errors
-
-* **Completeness Check:**
-  - Confirm all mathematical content is transposed
-  - Verify no equations are missing
-  - Check that variable definitions are consistent and unambiguous
-
-### V.5 Variable Naming Convention
-
-For camera calibration and imaging papers specifically:
-
-- Intrinsic parameters: `focal_length`, `principal_point_u`, `principal_point_v`, `radial_distortion_coeff`
-- Rotation/Extrinsic: `rotation_matrix`, `translation_vector`, `rodrigues_rotation_vector`
-- Image coordinates: `image_u`, `image_v`, `image_coords`
-- World/3D coordinates: `world_x`, `world_y`, `world_z`, `world_coords`
-- Camera coordinate systems: append `_cam` (e.g., `coords_cam`, `x_cam`)
-- Specific camera types: `focal_length_line_scan`, `focal_length_frame`, `rotation_matrix_stereo`
