@@ -1,31 +1,30 @@
-# ORCA_flow: Schematic-Style System Diagram Generator
+# ORCAflow: Schematic-Style System Diagram Generator
 
-## Project Overview
-
-ORCA flow is a web-based tool for generating professional system diagrams with clean orthogonal routing. Unlike force-directed layouts, it produces consistent, schematic-style results for engineering documentation.
+ORCA flow is a web-based tool for creating professional system diagrams with clean orthogonal wire routing—ideal for engineering documentation, technical reports, and publications.
 
 <img src="assets/orca_flow_demo.png" width="600" alt="ORCA Flow Demo">
 <img src="assets/flowschem-diagram.png" width="600" alt="Flowschem Diagram">
 
-### Core Problem
+## Roadmap
 
-Mermaid and similar tools:
-- Place nodes using physics simulation rather than grid alignment
-- Draw edges as curves or direct lines rather than orthogonal paths
-- Produce cluttered wire routing with overlapping connections
-- Lack the clean, professional appearance of PCB schematics or engineering block diagrams
+- [ ] Implement upward connection routing
+- [ ] Add cross-section wire routing
+- [ ] Support same-row node connections
+- [ ] Implement section-to-section connections
+- [ ] Add PNG export
+- [ ] Add PDF export with page sizing
+- [ ] Add `.flow` file save/load
+- [ ] Host online demo
+- [ ] Markdown/documentation integration
 
-### Solution
+## Features
 
-FlowSchem provides:
-- Grid-based node placement within defined segments
-- Orthogonal wire routing (horizontal and vertical only)
-- Uniform spacing and alignment
-- Rounded corners on wire bends with radius adjustment for bundled wires
-- Junction dots where wires branch (schematic style)
-- Hierarchical segment layout using flexbox-style nesting
-- Simple, minimal DSL for defining diagrams
-- Theming system with accessibility support for colour-blind users
+- **Grid-based layout** — Nodes align to a clean grid within hierarchical segments
+- **Orthogonal routing** — Wires travel only horizontally and vertically
+- **Schematic style** — Junction dots, uniform spacing, and professional appearance
+- **Simple DSL** — Define diagrams with minimal, readable syntax
+- **Theming** — Built-in colour themes with accessibility support for colour-blind users
+- **Export options** — SVG, PNG, PDF, and `.flow` source files
 
 ---
 
@@ -73,7 +72,7 @@ Layout definition using project's own syntax:
 [[Style]/[Layout]/[Nodes]][[[Generate][PDF][PNG][.flow][Zoom controls]]/[Preview]]
 ```
 
-### Features
+### UI Features
 
 - Left panel: Three collapsible input sections for Style, Layout, and Nodes
 - Right panel: Live preview with export buttons and zoom controls
