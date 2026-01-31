@@ -1,27 +1,11 @@
 # ORCA_flow: Schematic-Style System Diagram Generator
 
-## Quick Start
-
-```sh
-# Run locally with Python
-cd ORCA_flow
-python3 -m http.server 8000
-# Open browser to http://localhost:8000
-```
-
-**Keyboard Shortcuts:**
-
-- `Ctrl+Enter` - Generate preview
-- `Ctrl+Wheel` - Zoom in/out
-- `Ctrl+Shift+R` - Hard refresh (after code changes)
-
-**Zoom Controls:** Use the toolbar buttons (−, ⊡, %, +, 1:1) to zoom out, fit to window, zoom in, or reset to 100%.
-
----
-
 ## Project Overview
 
-ORCA flow is a web-based tool for generating clean, schematic-style system diagrams with orthogonal (horizontal/vertical) wire routing. It addresses limitations in existing tools like Mermaid, which use force-directed layouts that produce messy, non-uniform diagrams unsuitable for engineering documentation.
+ORCA flow is a web-based tool for generating professional system diagrams with clean orthogonal routing. Unlike force-directed layouts, it produces consistent, schematic-style results for engineering documentation.
+
+<img src="assets/orca_flow_demo.png" width="600" alt="ORCA Flow Demo">
+<img src="assets/flowschem-diagram.png" width="600" alt="Flowschem Diagram">
 
 ### Core Problem
 
@@ -42,6 +26,25 @@ FlowSchem provides:
 - Hierarchical segment layout using flexbox-style nesting
 - Simple, minimal DSL for defining diagrams
 - Theming system with accessibility support for colour-blind users
+
+---
+
+## Quick Start
+
+```sh
+# Run locally with Python
+cd ORCA_flow
+python3 -m http.server 8000
+# Open browser to http://localhost:8000
+```
+
+**Keyboard Shortcuts:**
+
+- `Ctrl+Enter` - Generate preview
+- `Ctrl+Wheel` - Zoom in/out
+- `Ctrl+Shift+R` - Hard refresh (after code changes)
+
+**Zoom Controls:** Use the toolbar buttons (−, ⊡, %, +, 1:1) to zoom out, fit to window, zoom in, or reset to 100%.
 
 ---
 
