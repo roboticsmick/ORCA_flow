@@ -102,6 +102,12 @@ const DefaultStyle = {
     'node-uniform': true
 };
 
+/** Style keys that hold a number, so a parsed value must become one. */
+const NumericStyleKeys = new Set(
+    Object.keys(DefaultStyle).filter(key => typeof DefaultStyle[key] === 'number')
+        .concat(['line-spacing', 'corner-radius'])
+);
+
 // =============================================================================
 // 4. COLOUR THEMES
 // =============================================================================
@@ -242,7 +248,16 @@ function parseStyle(input) {
             } else if (!isNaN(value) && value !== '') {
                 value = parseFloat(value);
             }
-            
+
+            // WHY: a numeric setting written with a unit, such as `14px`, used
+            // to stay a string, so sizes came out NaN or as concatenated text,
+            // and any string reaches SVG markup. A numeric key keeps only its
+            // number, or the default when there is none.
+            if (NumericStyleKeys.has(key) && typeof value !== 'number') {
+                const number = parseFloat(value);
+                value = Number.isFinite(number) ? number : DefaultStyle[key];
+            }
+
             config[key] = value;
         }
     }
@@ -406,24 +421,172 @@ function parseNameAndColor(str) {
     return [name, colorKey];
 }
 
+/** Largest number of layout tree nodes walked when collecting the layout scope. */
+const MAX_LAYOUT_NODES = 4096;
+
+/**
+ * @brief Collects the section keys and container names the layout places.
+ *
+ * A nodes block only owns nodes when the layout actually places it. A block
+ * the layout never mentions, such as a trailing block holding only links
+ * between stacks, declares nothing and its names are pure references.
+ *
+ * Walked with an explicit stack rather than by recursion, per P10 rule 1.
+ *
+ * @param {Object} layoutTree - Parsed layout tree, may be null.
+ * @returns {Object} { sections: Set<string>, containers: Set<string> }.
+ */
+function collectLayoutScope(layoutTree) {
+    const sections = new Set();
+    const containers = new Set();
+    if (!layoutTree) return { sections: sections, containers: containers };
+
+    const stack = [{ node: layoutTree, parent: null }];
+    let guard = 0;
+    while (stack.length > 0 && guard < MAX_LAYOUT_NODES) {
+        guard++;
+        const item = stack.pop();
+        const node = item.node;
+        if (!node) continue;
+
+        const hasChildren = node.children && node.children.length > 0;
+
+        if (node.type === 'segment' && !hasChildren) {
+            // Leaf. Both key forms are accepted because renderLayoutNode falls
+            // back to the bare name when the qualified key has no block.
+            if (item.parent) sections.add(item.parent + ':' + node.name);
+            sections.add(node.name);
+            continue;
+        }
+        if (node.type === 'segment') containers.add(node.name);
+
+        const childParent = node.type === 'segment' ? node.name : item.parent;
+        if (hasChildren) {
+            for (const child of node.children) stack.push({ node: child, parent: childParent });
+        }
+    }
+    console.assert(guard < MAX_LAYOUT_NODES, 'layout scope walk hit its bound');
+    return { sections: sections, containers: containers };
+}
+
+/**
+ * @brief Splits one endpoint into its optional section qualifier, name and hint.
+ *
+ * Accepted forms are `Name`, `Name/hint`, `section:Name` and
+ * `section:Name/hint`. The qualifier names the section the node lives in, which
+ * is how an endpoint reaches out of the block it is written in.
+ *
+ * @param {string} str - Raw endpoint text.
+ * @returns {Object} { qualifier, name, hint }.
+ */
+function parseEndpoint(str) {
+    const trimmed = (str || '').trim();
+    const colon = trimmed.indexOf(':');
+    const qualifier = colon > 0 ? trimmed.slice(0, colon).trim() : null;
+    const rest = colon > 0 ? trimmed.slice(colon + 1).trim() : trimmed;
+    const parts = rest.split('/');
+    return {
+        qualifier: qualifier,
+        name: parts[0].trim(),
+        hint: parts.length > 1 ? parts[1].trim() : null
+    };
+}
+
+/**
+ * @brief Resolves a link endpoint to a node id or a section name.
+ *
+ * Used for endpoints that may reach out of their own block, which is every
+ * endpoint of a bidirectional line and every endpoint carrying a qualifier.
+ * Directional lines keep their original block-local behaviour and never come
+ * here, so existing diagrams resolve exactly as before.
+ *
+ * Order is qualifier first, then the local block, then a unique match anywhere
+ * the layout places. An ambiguous bare name is reported rather than guessed.
+ *
+ * @pre ctx.declaredIn must be indexed over nodes that have a placed section.
+ *
+ * @param {Object} endpoint - From parseEndpoint().
+ * @param {string} localKey - Section key of the block the line is written in.
+ * @param {Object} ctx - { scope, declaredIn, scopeKnown }.
+ * @returns {Object} { kind: 'node'|'section'|'error', id, sectionKey, message }.
+ */
+function resolveLinkEndpoint(endpoint, localKey, ctx) {
+    console.assert(endpoint && typeof endpoint.name === 'string', 'endpoint must be parsed');
+    console.assert(typeof localKey === 'string', 'localKey must be a section key');
+
+    const base = generateNodeId(endpoint.name);
+    const declared = ctx.declaredIn.get(base);
+
+    if (endpoint.qualifier) {
+        const key = endpoint.qualifier;
+        if (!ctx.scope.sections.has(key)) {
+            return { kind: 'error', message: "Unknown section '" + key + "' in '" + key + ':' + endpoint.name + "'." };
+        }
+        if (!declared || !declared.has(key)) {
+            return { kind: 'error', message: "Section '" + key + "' has no node '" + endpoint.name + "'." };
+        }
+        return { kind: 'node', id: generateNodeId(endpoint.name, key), sectionKey: key };
+    }
+
+    // No layout yet, so nothing can be placed. Keep the old local behaviour
+    // rather than reporting every endpoint while the user is still typing.
+    if (!ctx.scopeKnown) {
+        return { kind: 'node', id: generateNodeId(endpoint.name, localKey), sectionKey: localKey };
+    }
+
+    if (declared && declared.has(localKey)) {
+        return { kind: 'node', id: generateNodeId(endpoint.name, localKey), sectionKey: localKey };
+    }
+
+    const candidates = declared ? Array.from(declared).sort() : [];
+    const isSection = ctx.scope.containers.has(endpoint.name) || ctx.scope.sections.has(endpoint.name);
+
+    if (isSection && candidates.length > 0) {
+        return { kind: 'error', message: "'" + endpoint.name + "' is both a section and a node in " + candidates.join(', ')
+            + ". Qualify the node as " + candidates[0] + ':' + endpoint.name + "." };
+    }
+    if (isSection) return { kind: 'section', id: endpoint.name };
+    if (candidates.length === 1) {
+        return { kind: 'node', id: generateNodeId(endpoint.name, candidates[0]), sectionKey: candidates[0] };
+    }
+    if (candidates.length > 1) {
+        return { kind: 'error', message: "'" + endpoint.name + "' is ambiguous: " + candidates.join(', ')
+            + ". Write " + candidates[0] + ':' + endpoint.name + "." };
+    }
+    return { kind: 'error', message: "Unknown endpoint '" + endpoint.name + "' in block '" + localKey + "'." };
+}
+
 /**
  * Parses the nodes block from input text.
  * Supports section-qualified names like "USV:sensors-1" for disambiguation.
  *
+ * Directional lines (`>`, `<`, `->`, `<-`) declare and connect inside one
+ * block, exactly as before. Bidirectional lines (`<>`, `<->`) and any endpoint
+ * written `section:Name` link nodes that already exist and may reach into
+ * another section, so they are resolved in a second pass once every block has
+ * been read and every node has a section.
+ *
  * @param {string} input - Raw nodes input text.
- * @returns {Object} Object containing nodes, connections, and sections.
+ * @param {Object} layoutTree - Parsed layout, so a block that the layout never
+ *                              places is known to declare nothing. May be null.
+ * @returns {Object} Object containing nodes, connections, sections and errors.
  */
-function parseNodes(input) {
+function parseNodes(input, layoutTree) {
     const result = {
         nodes: [],
         connections: [],
         sections: {},
-        nodeMap: {}  // Quick lookup by ID
+        nodeMap: {},  // Quick lookup by ID
+        errors: []
     };
 
     if (!input || !input.trim()) {
         return result;
     }
+
+    const scope = collectLayoutScope(layoutTree);
+    // Lines that may reach out of their own block, resolved after pass one.
+    const pendingLinks = [];
 
     const lines = input.split('\n');
     let currentSection = null;
@@ -468,7 +631,11 @@ function parseNodes(input) {
             const sectionKey = currentParent ? `${currentParent}:${currentSection}` : currentSection;
             const parsed = parseNodeLine(trimmed, sectionKey, currentRow);
 
-            if (parsed) {
+            if (parsed && needsLinkResolution(parsed)) {
+                // Reaches out of this block. Nothing is declared here, so the
+                // line contributes no nodes and no rows; pass two wires it up.
+                pendingLinks.push({ sectionKey: sectionKey, parsed: parsed });
+            } else if (parsed) {
                 // Add or update source node
                 if (!result.nodeMap[parsed.sourceId]) {
                     const sourceNode = {
@@ -546,7 +713,108 @@ function parseNodes(input) {
         }
     }
 
+    resolvePendingLinks(result, pendingLinks, scope);
+
     return result;
+}
+
+/**
+ * @brief Reports whether a parsed line must be resolved across blocks.
+ *
+ * A bidirectional line states a link between things that already exist rather
+ * than declaring them, and a qualified endpoint names its section outright.
+ * Either way the endpoints are references, not declarations.
+ *
+ * @param {Object} parsed - Output of parseNodeLine().
+ * @returns {boolean} True when the line is handled by resolvePendingLinks().
+ */
+function needsLinkResolution(parsed) {
+    console.assert(parsed && parsed.sourceRaw, 'parsed line must carry raw endpoints');
+    if (parsed.connectionType === 'bidirectional') return true;
+    if (parsed.sourceRaw.qualifier) return true;
+    const targets = parsed.targetsRaw || [];
+    for (const target of targets) {
+        if (target.qualifier) return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Wires up the lines that reach out of their own block.
+ *
+ * Runs after every block has been read, so a link may name a node declared
+ * later in the input. An endpoint that cannot be resolved is recorded in
+ * result.errors rather than dropped, which is what used to hide the fact that
+ * no cross-section wire resolved at all.
+ *
+ * @pre Every node that the layout places must already have its section set.
+ *
+ * @param {Object} result - Parse result, mutated in place.
+ * @param {Array} pendingLinks - [{ sectionKey, parsed }] collected in pass one.
+ * @param {Object} scope - Output of collectLayoutScope().
+ * @returns {void}
+ */
+function resolvePendingLinks(result, pendingLinks, scope) {
+    console.assert(Array.isArray(pendingLinks), 'pendingLinks must be an array');
+    console.assert(result && result.nodeMap, 'result must be a parse result');
+    if (pendingLinks.length === 0) return;
+
+    // Index the placed nodes by bare name, so a reference can find the one
+    // section that declares it, or report the several that do.
+    const declaredIn = new Map();
+    for (const node of result.nodes) {
+        if (!node.section || !scope.sections.has(node.section)) continue;
+        const base = generateNodeId(node.name);
+        if (!declaredIn.has(base)) declaredIn.set(base, new Set());
+        declaredIn.get(base).add(node.section);
+    }
+
+    const ctx = { scope: scope, declaredIn: declaredIn, scopeKnown: scope.sections.size > 0 };
+    const seenErrors = new Set();
+
+    /**
+     * @brief Records one resolution failure, without repeating it.
+     * @param {string} message - Human readable reason.
+     * @returns {void}
+     */
+    function report(message) {
+        if (seenErrors.has(message)) return;
+        seenErrors.add(message);
+        result.errors.push(message);
+    }
+
+    for (const link of pendingLinks) {
+        const from = resolveLinkEndpoint(link.parsed.sourceRaw, link.sectionKey, ctx);
+        if (from.kind === 'error') {
+            report(from.message);
+            continue;
+        }
+
+        for (const rawTarget of link.parsed.targetsRaw) {
+            const to = resolveLinkEndpoint(rawTarget, link.sectionKey, ctx);
+            if (to.kind === 'error') {
+                report(to.message);
+                continue;
+            }
+
+            const connection = {
+                from: from.id,
+                to: to.id,
+                type: link.parsed.connectionType || 'to',
+                dashed: link.parsed.dashed,
+                fromKind: from.kind,
+                toKind: to.kind
+            };
+            result.connections.push(connection);
+
+            if (from.kind === 'node' && result.nodeMap[from.id]) {
+                result.nodeMap[from.id].connectionsOut.push(connection);
+            }
+            if (to.kind === 'node' && result.nodeMap[to.id]) {
+                result.nodeMap[to.id].connectionsIn.push(connection);
+            }
+        }
+    }
 }
 
 /**
@@ -574,19 +842,21 @@ function parseNodeLine(line, section, row) {
             const sourceStr = parts[0].trim();
             const targetStr = parts.slice(1).join('').trim();
 
-            const source = parseNodeName(sourceStr);
-            const targets = targetStr.split(',').map(t => parseNodeName(t.trim()));
+            const source = parseEndpoint(sourceStr);
+            const targets = targetStr.split(',').map(t => parseEndpoint(t.trim()));
 
             // Use section-qualified IDs for consistency (same section for all within a section block)
             return {
                 sourceId: generateNodeId(source.name, section),
                 sourceName: source.name,
                 sourceHint: source.hint,
+                sourceRaw: source,
                 targets: targets.map(t => ({
                     id: generateNodeId(t.name, section),
                     name: t.name,
                     hint: t.hint
                 })),
+                targetsRaw: targets,
                 connectionType: type,
                 dashed: dashed
             };
@@ -594,12 +864,14 @@ function parseNodeLine(line, section, row) {
     }
 
     // Standalone node (no connection)
-    const node = parseNodeName(line);
+    const node = parseEndpoint(line);
     return {
         sourceId: generateNodeId(node.name, section),
         sourceName: node.name,
         sourceHint: node.hint,
+        sourceRaw: node,
         targets: [],
+        targetsRaw: [],
         connectionType: null,
         dashed: false
     };
@@ -647,12 +919,9 @@ function generateNodeId(name, section = '') {
  *   - 3 nodes: 0.167, 0.5, 0.833
  *   - 4 nodes: 0.125, 0.375, 0.625, 0.875
  *
- * Exit positions are the vertical corridors between nodes where wires can
- * travel without intersecting nodes. For n nodes, there are n+1 exit positions:
- *   exitPosition(e, n) = e / (n + 1) for e in [0, 1, ..., n]
- *
- * Grid heights between rows are calculated based on the number of
- * routing channels needed (with channel sharing optimization).
+ * Row spacing is not decided here. The router works out how many channels
+ * each gap needs, and every gap in the diagram then takes the largest of
+ * those, so the rows line up across the whole page.
  *
  * @pre nodesData must contain sections[sectionKey] with nodes
  * @pre Each section must have at least one node
@@ -660,8 +929,8 @@ function generateNodeId(name, section = '') {
  * @param {Object} nodesData - Parsed nodes data with sections and nodeMap.
  * @param {string} sectionKey - The section name to calculate layout for.
  * @returns {Object} Layout object with:
- *   - rows: Array of { rowNum, nodes, nodeCount, exitPositions } where each node has column position
- *   - gridHeights: Array of grid heights between adjacent rows
+ *   - rows: Array of { rowNum, nodes, nodeCount } where each node has a column
+ *   - maxColumns: Largest node count in any row
  *   Returns null if section not found or empty.
  */
 function calculateSectionLayout(nodesData, sectionKey) {
@@ -670,8 +939,7 @@ function calculateSectionLayout(nodesData, sectionKey) {
 
     const layout = {
         rows: [],
-        maxColumns: 0,
-        gridHeights: []  // Height (in grid units) between each row pair
+        maxColumns: 0
     };
 
     // Build row data with nodes
@@ -683,1781 +951,994 @@ function calculateSectionLayout(nodesData, sectionKey) {
         const nodeCount = rowNodes.length;
         rowNodes.forEach((node, index) => {
             node.column = nodeCount > 0 ? (2 * (index + 1) - 1) / (2 * nodeCount) : 0.5;
-
-            // Initialize port arrays for each node
-            // Ports will be populated during connection routing
-            node.ports = {
-                top: [],     // Ports on top edge (incoming from above, outgoing upward)
-                bottom: []   // Ports on bottom edge (outgoing downward, incoming from same row)
-            };
         });
 
-        // Calculate exit positions for this row: e/n for e in [0..n]
-        // These are the vertical corridors between/outside nodes for wire routing
-        // For n=2 nodes at columns 0.25 and 0.75, exits should be at 0, 0.5, 1.0
-        const exitPositions = [];
-        for (let e = 0; e <= nodeCount; e++) {
-            exitPositions.push(nodeCount > 0 ? e / nodeCount : (e === 0 ? 0 : 1));
-        }
-
+        // Routing corridors are derived from real node footprints by the
+        // router, so no fractional exit positions are needed here.
         layout.rows.push({
             rowNum,
             nodes: rowNodes,
-            nodeCount: rowNodes.length,
-            exitPositions: exitPositions
+            nodeCount: rowNodes.length
         });
 
         layout.maxColumns = Math.max(layout.maxColumns, nodeCount);
     }
 
-    // Build set of all node IDs in this section for filtering
-    const sectionNodeIds = new Set();
-    for (let rowNum = 1; rowNum <= section.maxRow; rowNum++) {
-        const nodeIds = section.rows[rowNum] || [];
-        nodeIds.forEach(id => sectionNodeIds.add(id));
-    }
-
-    // Calculate grid heights between rows
-    for (let i = 0; i < layout.rows.length - 1; i++) {
-        const rowAbove = layout.rows[i];
-        const rowBelow = layout.rows[i + 1];
-        const gridHeight = calculateGridHeight(rowAbove, rowBelow, nodesData, sectionNodeIds);
-        layout.gridHeights.push(gridHeight);
-    }
-
     return layout;
 }
 
+// =============================================================================
+// 6b. SECTION PLANNING (orthogonal channel router)
+//
+// Node X positions, row heights and every wire path come from one plan per
+// section, produced by js/router.js. The plan is built in a local coordinate
+// space whose origin is the left edge of the section content, so the same plan
+// serves both the sizing pass and the render pass. Sizing runs first and warms
+// the cache, which is what keeps the reserved height and the drawn wires in
+// step.
+// =============================================================================
+
+/** Plans built during the current render, keyed by section. Cleared per run. */
+const SectionPlanCache = {};
+
+/** Gap height shared by every section of the current diagram. */
+let ActiveGapHeight = 0;
+
+/** Extra width allowed per node so corridors between them stay routable. */
+const NODE_COLUMN_SPACING = 20;
+
+/** Smallest section content width, enough to hold the section label. */
+const MIN_SECTION_WIDTH = 150;
+
+/** Vertical padding below the last row inside a section box. */
+const SECTION_BOTTOM_PADDING = 16;
+
+/** Height of the section heading strip. */
+const SECTION_LABEL_HEIGHT = 30;
+
+/** Inset from a segment box edge to its contents, and a floor for a gutter. */
+const LAYOUT_PADDING = 8;
+
+/** Separation between sibling boxes, and a floor for a gutter. */
+const LAYOUT_GUTTER = 10;
+
+/** The plan the last render was emitted from, for the debug harness. */
+let LastDiagramPlan = null;
+
+/** Gutter plans built during the current render, keyed by level box id. */
+const GutterPlanCache = {};
+
+/** Level tree and per-level net pieces for the current diagram. */
+let ActiveLevels = null;
+
+/** Boundary port X per level id and net key, in that level's content space. */
+let BoundaryHints = {};
+
+/** Most size, place and join rounds the plan phase takes to settle. */
+const MAX_JOIN_PASSES = 4;
+
 /**
- * @brief Finds the largest exit position less than or equal to target centreline.
- *
- * Used when routing wires to targets on the LEFT of the source node.
- * The wire should use an exit position that doesn't cross over the target.
- *
- * @param {number} targetCentreline - Target node's centreline position (0 to 1).
- * @param {number} rowNodeCount - Number of nodes in the row being traversed.
- * @returns {number} Exit position value (0 to 1).
+ * @brief Clears the plan cache so a fresh render replans every section.
+ * @returns {void}
  */
-function getFloorExitPosition(targetCentreline, rowNodeCount) {
-    const n = rowNodeCount;
-    if (n === 0) return 0;
-
-    // Check exit positions from right to left: n/n=1, (n-1)/n, ..., 0
-    for (let e = n; e >= 0; e--) {
-        const exitPos = e / n;
-        if (exitPos <= targetCentreline) {
-            return exitPos;
-        }
+function resetSectionPlans() {
+    for (const key in SectionPlanCache) {
+        delete SectionPlanCache[key];
     }
-    return 0;  // Leftmost exit
-}
-
-/**
- * @brief Finds the smallest exit position greater than or equal to target centreline.
- *
- * Used when routing wires to targets on the RIGHT of the source node.
- * The wire should use an exit position that doesn't cross over the target.
- *
- * @param {number} targetCentreline - Target node's centreline position (0 to 1).
- * @param {number} rowNodeCount - Number of nodes in the row being traversed.
- * @returns {number} Exit position value (0 to 1).
- */
-function getCeilExitPosition(targetCentreline, rowNodeCount) {
-    const n = rowNodeCount;
-    if (n === 0) return 1;
-
-    // Check exit positions from left to right: 0, 1/n, 2/n, ..., n/n=1
-    for (let e = 0; e <= n; e++) {
-        const exitPos = e / n;
-        if (exitPos >= targetCentreline) {
-            return exitPos;
-        }
-    }
-    return 1.0;  // Rightmost exit
-}
-
-/**
- * @brief Calculates the effective position for port ordering.
- *
- * For targets in the same row or adjacent row, uses the target's centreline.
- * For targets beyond the adjacent row, calculates the exit position the wire
- * will use when passing through the adjacent row.
- *
- * This ensures ports are ordered by where their wires will actually travel,
- * minimizing wire crossings.
- *
- * @param {Object} source - Source node with row and column properties.
- * @param {Object} target - Target node with row and column properties.
- * @param {Object} sectionLayout - Layout object with rows array containing exitPositions.
- * @returns {number} Effective position for sorting (0 to 1).
- */
-function calculateEffectivePosition(source, target, sectionLayout) {
-    const rowDiff = Math.abs(target.row - source.row);
-
-    // Same row or adjacent row: use target centreline directly
-    if (rowDiff <= 1) {
-        return target.column;
-    }
-
-    // Multi-row: calculate which exit position the wire will use in the adjacent row
-    const goingDown = target.row > source.row;
-    const adjacentRowIndex = goingDown ? source.row : source.row - 2;  // 0-indexed
-
-    // Bounds check
-    if (adjacentRowIndex < 0 || adjacentRowIndex >= sectionLayout.rows.length) {
-        return target.column;  // Fallback to target centreline
-    }
-
-    const adjacentRow = sectionLayout.rows[adjacentRowIndex];
-    const nodeCount = adjacentRow ? adjacentRow.nodeCount : 1;
-
-    // Choose exit position based on target direction relative to source
-    if (target.column <= source.column) {
-        // Target is to the LEFT - use floor exit position
-        return getFloorExitPosition(target.column, nodeCount);
-    } else {
-        // Target is to the RIGHT - use ceil exit position
-        return getCeilExitPosition(target.column, nodeCount);
+    for (const key in GutterPlanCache) {
+        delete GutterPlanCache[key];
     }
 }
 
 /**
- * @brief Sorts port entries using the 5-set algorithm for optimal port ordering.
+ * @brief Computes the height of one node box from the style and its contents.
  *
- * The 5-set algorithm minimizes wire crossings by ordering ports from left to right
- * based on their destinations:
+ * Every node in a section shares a height so the rows stay level, so the hint
+ * line is reserved whenever any node in the section carries one.
  *
- * Set A: Same row, LEFT of source → leftmost ports
- * Set B: Different row, LEFT of source (by effective position)
- * Set C: Aligned with source (same centreline)
- * Set D: Same row, RIGHT of source
- * Set E: Different row, RIGHT of source (by effective position) → rightmost ports
- *
- * Final order: [A, B, C, D, E]
- *
- * @param {Object} sourceNode - The source node with row and column properties.
- * @param {Array} portEntries - Array of port entries with targetCol/sourceCol and target/source refs.
- * @param {Object} sectionLayout - Layout object for effective position calculation.
- * @param {string} direction - 'outgoing' (uses targetCol) or 'incoming' (uses sourceCol).
- * @returns {Array} Sorted port entries in optimal left-to-right order.
+ * @param {Object} sectionLayout - Layout with rows of nodes.
+ * @param {Object} style - Style configuration.
+ * @returns {number} Node height in pixels.
  */
-function sortPortsUsing5SetAlgorithm(sourceNode, portEntries, sectionLayout, direction) {
-    const TOLERANCE = 0.01;
-    const sourceCol = sourceNode.column;
-    const sourceRow = sourceNode.row;
+function nodeHeightForSection(sectionLayout, style) {
+    const fontSize = style['font-size'] || 14;
+    const hintSize = style['hint-size'] || 11;
+    const lineSpacing = 6;
+    const padding = parsePaddingValues(style['node-padding']);
 
-    // Partition into 5 sets
-    const setA = [];  // Same row, left
-    const setB = [];  // Different row, left
-    const setC = [];  // Aligned
-    const setD = [];  // Same row, right
-    const setE = [];  // Different row, right
+    const hasAnyHints = sectionLayout.rows.some(row => row.nodes.some(n => n.hint));
+    const textHeight = hasAnyHints ? fontSize + lineSpacing + hintSize : fontSize;
 
-    for (const entry of portEntries) {
-        // Get target info based on direction
-        let targetCol, targetRow, target;
-        if (direction === 'outgoing') {
-            targetCol = entry.targetCol;
-            target = entry.target;
-            targetRow = target ? target.row : sourceRow;
-        } else {
-            // For incoming, the "target" is actually the source of the connection
-            targetCol = entry.sourceCol;
-            target = entry.source;
-            targetRow = target ? target.row : sourceRow;
-        }
-
-        const sameRow = targetRow === sourceRow;
-        const rowDist = Math.abs(targetRow - sourceRow);
-
-        // Calculate effective position for multi-row
-        let effectivePos = targetCol;
-        if (!sameRow && target && sectionLayout) {
-            effectivePos = calculateEffectivePosition(sourceNode, target, sectionLayout);
-        }
-
-        // Classify into sets
-        if (Math.abs(effectivePos - sourceCol) <= TOLERANCE) {
-            // Set C: Aligned
-            setC.push({ entry, effectivePos, rowDist, sortKey: rowDist });
-        } else if (effectivePos < sourceCol) {
-            // Left side
-            if (sameRow) {
-                // Set A: Same row, left
-                setA.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            } else {
-                // Set B: Different row, left
-                setB.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            }
-        } else {
-            // Right side
-            if (sameRow) {
-                // Set D: Same row, right
-                setD.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            } else {
-                // Set E: Different row, right
-                setE.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            }
-        }
-    }
-
-    // Sort each set
-    // A: by effective position ascending
-    setA.sort((a, b) => a.sortKey - b.sortKey);
-    // B: by effective position ascending, then row distance
-    setB.sort((a, b) => a.sortKey - b.sortKey || a.rowDist - b.rowDist);
-    // C: by row distance ascending (closest first)
-    setC.sort((a, b) => a.sortKey - b.sortKey);
-    // D: by effective position ascending
-    setD.sort((a, b) => a.sortKey - b.sortKey);
-    // E: by effective position ascending, then row distance
-    setE.sort((a, b) => a.sortKey - b.sortKey || a.rowDist - b.rowDist);
-
-    // Combine in order: [A, B, C, D, E]
-    const sorted = [...setA, ...setB, ...setC, ...setD, ...setE];
-
-    // Return just the entries in sorted order
-    return sorted.map(item => item.entry);
+    return padding.top + textHeight + padding.bottom;
 }
 
 /**
- * @brief Sorts edge port entries using the 5-set algorithm.
+ * @brief Builds, or returns from cache, the routing plan for one section.
  *
- * This is a wrapper around sortPortsUsing5SetAlgorithm that works with
- * the edge port entry format used in calculateRoutes().
+ * The plan fixes the content width, the node X positions, the uniform gap
+ * height and every wire path. Callers translate the result into page
+ * coordinates; nothing here depends on where the section ends up.
  *
- * Port entries have: { routeIndices, otherCol, otherNode, type, isShared }
+ * @pre nodesData.sections[sectionKey] must exist.
  *
- * The algorithm classifies ports by where their "other" node is relative
- * to the center node, using the 5-set ordering:
- *   [A, B, C, D, E] = [same-row-left, diff-row-left, aligned, same-row-right, diff-row-right]
- *
- * Shared ports (no otherNode) are sorted by otherCol position only.
- *
- * @param {Object} centerNode - The node whose edge we're sorting.
- * @param {Array} portEntries - Edge port entries with otherCol/otherNode.
- * @param {Object} sectionLayout - Layout data for effective position calculation.
- * @returns {Array} Sorted port entries in left-to-right order.
+ * @param {Object} nodesData - Parsed nodes data with sections and nodeMap.
+ * @param {string} sectionKey - Section to plan.
+ * @param {Object} style - Style configuration.
+ * @param {number} uniformGapHeight - Gap height shared by the whole diagram, or
+ *                                    0 to use this section's own requirement.
+ * @returns {Object|null} Plan bundle, or null when the section is empty.
  */
-function sortPortsForEdge(centerNode, portEntries, sectionLayout) {
-    const TOLERANCE = 0.01;
-    const centerCol = centerNode.column;
-    const centerRow = centerNode.row;
+function getSectionPlan(nodesData, sectionKey, style, uniformGapHeight = 0) {
+    const cacheKey = sectionKey + '|' + uniformGapHeight;
+    if (SectionPlanCache[cacheKey]) return SectionPlanCache[cacheKey];
 
-    // Partition into 5 sets
-    const setA = [];  // Same row, left
-    const setB = [];  // Different row, left
-    const setC = [];  // Aligned
-    const setD = [];  // Same row, right
-    const setE = [];  // Different row, right
+    const sectionLayout = calculateSectionLayout(nodesData, sectionKey);
+    if (!sectionLayout || sectionLayout.rows.length === 0) return null;
 
-    for (const entry of portEntries) {
-        const otherNode = entry.otherNode;
-        const otherCol = entry.otherCol;
+    const nodeMinWidth = style['node-min-width'] || 120;
+    const nodeHeight = nodeHeightForSection(sectionLayout, style);
 
-        // For shared ports without a specific other node, use column only
-        if (!otherNode) {
-            // Classify by column position relative to center
-            // Check isDifferentRow flag to determine same-row vs different-row sets
-            const isDifferentRow = entry.isDifferentRow === true;
+    const maxNodesInRow = Math.max(...sectionLayout.rows.map(r => r.nodes.length), 1);
+    let contentWidth = Math.max(
+        maxNodesInRow * (nodeMinWidth + NODE_COLUMN_SPACING),
+        MIN_SECTION_WIDTH
+    );
 
-            if (Math.abs(otherCol - centerCol) <= TOLERANCE) {
-                setC.push({ entry, effectivePos: otherCol, rowDist: 0, sortKey: 0 });
-            } else if (otherCol < centerCol) {
-                // Left side: Set A (same-row) or Set B (different-row)
-                if (isDifferentRow) {
-                    setB.push({ entry, effectivePos: otherCol, rowDist: 1, sortKey: otherCol });
-                } else {
-                    setA.push({ entry, effectivePos: otherCol, rowDist: 0, sortKey: otherCol });
-                }
-            } else {
-                // Right side: Set D (same-row) or Set E (different-row)
-                if (isDifferentRow) {
-                    setE.push({ entry, effectivePos: otherCol, rowDist: 1, sortKey: otherCol });
-                } else {
-                    setD.push({ entry, effectivePos: otherCol, rowDist: 0, sortKey: otherCol });
-                }
-            }
-            continue;
-        }
+    const leaf = ActiveLevels ? ActiveLevels.tree.bySection[sectionKey] : null;
+    const levelId = leaf ? leaf.id : null;
 
-        const otherRow = otherNode.row;
-        const sameRow = otherRow === centerRow;
-        const rowDist = Math.abs(otherRow - centerRow);
-
-        // Calculate effective position for multi-row connections
-        let effectivePos = otherCol;
-        if (!sameRow && sectionLayout) {
-            effectivePos = calculateEffectivePosition(centerNode, otherNode, sectionLayout);
-        }
-
-        // Classify into sets
-        if (Math.abs(effectivePos - centerCol) <= TOLERANCE) {
-            // Set C: Aligned
-            setC.push({ entry, effectivePos, rowDist, sortKey: rowDist });
-        } else if (effectivePos < centerCol) {
-            // Left side
-            if (sameRow) {
-                setA.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            } else {
-                setB.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            }
-        } else {
-            // Right side
-            if (sameRow) {
-                setD.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            } else {
-                setE.push({ entry, effectivePos, rowDist, sortKey: effectivePos });
-            }
-        }
+    /**
+     * @brief Places nodes in section-local space for a given content width.
+     * @param {number} width - Content width to lay the rows out across.
+     * @returns {Array} Rows in the shape planSection() expects.
+     */
+    function layoutRowsAt(width) {
+        return sectionLayout.rows.map(row => ({
+            nodes: row.nodes.map(node => {
+                node.pixelWidth = nodeMinWidth;
+                node.pixelHeight = nodeHeight;
+                node.localX = node.column * width;
+                return { id: node.id, width: nodeMinWidth, centreX: node.localX };
+            })
+        }));
     }
 
-    // Sort each set
-    setA.sort((a, b) => a.sortKey - b.sortKey);
-    setB.sort((a, b) => a.sortKey - b.sortKey || a.rowDist - b.rowDist);
-    setC.sort((a, b) => a.sortKey - b.sortKey);
-    setD.sort((a, b) => a.sortKey - b.sortKey);
-    setE.sort((a, b) => a.sortKey - b.sortKey || a.rowDist - b.rowDist);
-
-    // Combine in order: [A, B, C, D, E]
-    const sorted = [...setA, ...setB, ...setC, ...setD, ...setE];
-
-    return sorted.map(item => item.entry);
-}
-
-/**
- * @brief Calculates the grid height between two rows based on channel requirements.
- *
- * This function implements the channel calculation algorithm from the routing spec.
- * It considers ALL connections that use the gap between rowAbove and rowBelow:
- *
- * 1. Exit channels: Wires originating from rowAbove
- * 2. Entry channels: Wires terminating at rowBelow
- * 3. Pass-through channels: Wires passing through to lower rows
- *
- * Channel sharing rules:
- * - Outgoing from same source: Each gets separate channel (counted by target)
- * - Incoming to same target: Share ONE channel (junctions merge)
- * - Pass-through wires to same target: Share channel with destination entry
- *
- * Formula:
- *   gridHeight = max(3, uniqueChannels + arrowClearance + buffer)
- *
- * @pre nodesData must contain nodeMap for source/target lookup
- * @pre rowAbove/rowBelow must have rowNum property
- *
- * @param {Object} rowAbove - Row above data with rowNum.
- * @param {Object} rowBelow - Row below data with rowNum.
- * @param {Object} nodesData - Full nodes data with nodeMap.
- * @param {Set|null} sectionNodeIds - Optional set of node IDs to filter. If provided,
- *                                    only connections between nodes in this set are counted.
- * @returns {number} Grid height in units (minimum 3).
- */
-function calculateGridHeight(rowAbove, rowBelow, nodesData, sectionNodeIds = null) {
-    const ALIGNMENT_TOLERANCE = 0.01;
-    const rowAboveNum = rowAbove.rowNum;
-    const rowBelowNum = rowBelow.rowNum;
-    let hasBidirectional = false;
-
-    // Track unique channels needed
-    // Key insight: incoming connections to the same target share a channel
-    // So we track by target ID for connections ending in this gap or passing through
-    const channelTargets = new Set();
-
-    // Iterate through nodes to find connections using this row gap
-    // If sectionNodeIds is provided, only process nodes in that section
-    for (const nodeId in nodesData.nodeMap) {
-        // Filter to only nodes in the current section
-        if (sectionNodeIds && !sectionNodeIds.has(nodeId)) continue;
-
-        const sourceNode = nodesData.nodeMap[nodeId];
-
-        for (const conn of sourceNode.connectionsOut) {
-            const targetNode = nodesData.nodeMap[conn.to];
-            if (!targetNode) continue;
-
-            // Also ensure target is in the same section
-            if (sectionNodeIds && !sectionNodeIds.has(conn.to)) continue;
-
-            const sourceRow = sourceNode.row;
-            const targetRow = targetNode.row;
-
-            // Check if this connection uses the gap between rowAbove and rowBelow
-            // The gap is used by wires going EITHER direction through it
-            let usesThisGap = false;
-
-            if (sourceRow <= rowAboveNum && targetRow >= rowBelowNum) {
-                // Downward connection: source at or above rowAbove, target at or below rowBelow
-                usesThisGap = true;
-            } else if (sourceRow >= rowBelowNum && targetRow <= rowAboveNum) {
-                // Upward connection: source at or below rowBelow, target at or above rowAbove
-                usesThisGap = true;
-            }
-
-            if (usesThisGap) {
-                // Check if non-aligned (needs a horizontal routing channel)
-                const isNonAligned = Math.abs(sourceNode.column - targetNode.column) > ALIGNMENT_TOLERANCE;
-
-                if (isNonAligned) {
-                    // For channel counting, we group by target (incoming share channel)
-                    channelTargets.add(conn.to);
-                }
-
-                if (conn.type === 'bidirectional') {
-                    hasBidirectional = true;
-                }
-            }
-        }
+    // Collect every connection whose two ends live in this section.
+    const sectionIds = new Set();
+    for (const row of sectionLayout.rows) {
+        for (const node of row.nodes) sectionIds.add(node.id);
     }
 
-    // Channels needed = number of unique targets with non-aligned connections
-    // that use this row gap (either terminating here or passing through)
-    const channelsNeeded = channelTargets.size;
-
-    // Arrow clearance: space for arrowheads
-    // - If any bidirectional: need clearance at both source and destination ends
-    // - For unidirectional: only need clearance at destination (target has arrow)
-    const arrowSpaceSource = hasBidirectional ? 1 : 0;
-    const arrowSpaceDest = 1;
-    const buffer = 1;
-
-    return Math.max(3, channelsNeeded + arrowSpaceSource + arrowSpaceDest + buffer);
-}
-
-/**
- * @brief Builds connection routing data for a section.
- *
- * Connection Routing Algorithm:
- * 1. Collect all connections between each pair of adjacent rows
- * 2. Sort connections by target column position (left to right)
- * 3. Assign unique grid channels to each non-aligned connection
- * 4. Vertically aligned connections (source.column ≈ target.column) use straight lines
- * 5. Calculate port offsets for multiple connections from same node
- * 6. Handle both downward AND upward connections (for < operator)
- *
- * Channel Assignment:
- * - Connections to the SAME target share a horizontal channel (for merging)
- * - Connections to DIFFERENT targets get separate channels (no overlap)
- * - Channels are numbered so leftmost targets use higher channels (turn first)
- *
- * Port Spacing Rules:
- * - Outgoing ports (bottom edge): Sorted left-to-right by target column
- * - Incoming ports (top edge): Sorted left-to-right by source column
- * - Bidirectional connections use two separate ports (out and in)
- *
- * Port offset formula for n ports, port index i (0-indexed):
- *   offset = (2i - n + 1) * portSpacing / 2
- *
- * This ordering prevents wire crossings:
- * - Leftmost targets use channels closest to source (highest numbers)
- * - Rightmost targets use channels closest to destination (lowest numbers)
- * - Wires turn at different horizontal positions, avoiding overlaps
- *
- * @pre sectionLayout must contain rows array with nodes having connectionsOut
- * @pre nodesData must contain nodeMap for target node lookup
- *
- * @param {Object} sectionLayout - Layout from calculateSectionLayout with rows.
- * @param {Object} nodesData - Full nodes data with nodeMap.
- * @returns {Array} Array of route objects with: from, to, type, dashed, isStraight,
- *                  gapChannels (object mapping gap key to channel number),
- *                  sourceRow, targetRow, sourcePortOffset, targetPortOffset,
- *                  direction ('down' or 'up').
- */
-function buildConnectionRoutes(sectionLayout, nodesData) {
-    const routes = [];
-    const ALIGNMENT_TOLERANCE = 0.01;  // Tolerance for "vertically aligned" check
-
-    // Track port assignments per node for proper spacing
-    // Port count formula: outgoing + bidirectional + min(1, incoming)
-    // All incoming connections to a node share ONE port
-    //
-    // Structure:
-    //   outgoing: [{targetCol, routeIndex}] - each gets own port
-    //   incoming: [{sourceCol, routeIndex}] - ALL share one port
-    //   outgoingTop: [{targetCol, routeIndex}] - each gets own port (upward)
-    //   incomingBottom: [{sourceCol, routeIndex}] - ALL share one port (upward into bottom)
-    const portAssignments = {};
-
-    // =========================================================================
-    // UNIFIED CHANNEL ASSIGNMENT
-    //
-    // Algorithm:
-    // 1. Collect ALL connections from the section (both downward and upward)
-    // 2. For each gap, collect all connections that PASS THROUGH it
-    //    (including pass-through connections from distant rows)
-    // 3. Group by target, sort by target column (rightmost first)
-    // 4. Assign channels 1, 2, 3, ... so rightmost targets turn last
-    // 5. Create routes with assigned channels
-    //
-    // This ensures all connections through a gap get unique channels,
-    // regardless of which row they originate from or their direction.
-    // =========================================================================
-
-    // Step 1: Collect ALL connections from the section
-    const allConnections = [];
+    const connections = [];
+    let connIndex = 0;
     for (const row of sectionLayout.rows) {
         for (const node of row.nodes) {
             for (const conn of node.connectionsOut) {
-                const target = nodesData.nodeMap[conn.to];
-                if (target && target.row !== null && target.row !== node.row) {
-                    allConnections.push({
-                        source: node,
-                        target: target,
-                        type: conn.type,
-                        dashed: conn.dashed,
-                        direction: node.row < target.row ? 'down' : 'up'
-                    });
-                }
+                if (!sectionIds.has(conn.to)) continue;
+                connections.push({
+                    id: 'c' + (connIndex++),
+                    from: node.id,
+                    to: conn.to,
+                    type: conn.type,
+                    dashed: conn.dashed
+                });
             }
         }
     }
 
-    // Step 2: For each gap, collect all connections passing through
-    // A connection passes through gap [rowA, rowB] if:
-    //   - Downward: source.row <= rowA AND target.row >= rowB
-    //   - Upward: source.row >= rowB AND target.row <= rowA
-    const gapConnections = {};  // key: "rowA-rowB", value: array of connections
+    const geometry = {
+        nodeHeight: nodeHeight,
+        hTrackPitch: style['line-spacing'] || 15,
+        clearance: 10,
+        portPitch: 12,
+        portInset: 8,
+        arrowClearance: 12,
+        cornerRadius: style['corner-radius'] !== undefined ? style['corner-radius'] : 4
+    };
 
-    for (let i = 0; i < sectionLayout.rows.length - 1; i++) {
-        const rowAboveNum = sectionLayout.rows[i].rowNum;
-        const rowBelowNum = sectionLayout.rows[i + 1].rowNum;
-        const gapKey = `${rowAboveNum}-${rowBelowNum}`;
-        gapConnections[gapKey] = [];
-
-        for (const conn of allConnections) {
-            const sourceRow = conn.source.row;
-            const targetRow = conn.target.row;
-
-            // Check if connection passes through this gap
-            const passesDown = sourceRow <= rowAboveNum && targetRow >= rowBelowNum;
-            const passesUp = sourceRow >= rowBelowNum && targetRow <= rowAboveNum;
-
-            if (passesDown || passesUp) {
-                // Check if non-aligned (needs a channel)
-                const isAligned = Math.abs(conn.source.column - conn.target.column) <= ALIGNMENT_TOLERANCE;
-                if (!isAligned) {
-                    gapConnections[gapKey].push(conn);
-                }
-            }
-        }
-    }
-
-    // Step 3: Assign channels PER-GAP
-    // Each gap gets its own channel numbering (1, 2, 3, ...)
-    // A connection may have different channel numbers in different gaps
-    //
-    // For each gap:
-    // - Group connections by target
-    // - Sort targets by column (rightmost first = channel 1)
-    // - Assign channels within that gap
-    //
-    // Store: connectionGapChannels.get(conn) = { "1-2": 1, "2-3": 3, ... }
-    const connectionGapChannels = new Map();  // conn -> { gapKey: channel, ... }
-
-    for (const gapKey in gapConnections) {
-        const connsInGap = gapConnections[gapKey];
-
-        // Group connections in this gap by target
-        const gapTargetGroups = {};  // target.id -> { target, connections: [] }
-        for (const conn of connsInGap) {
-            if (!gapTargetGroups[conn.target.id]) {
-                gapTargetGroups[conn.target.id] = {
-                    target: conn.target,
-                    connections: []
-                };
-            }
-            gapTargetGroups[conn.target.id].connections.push(conn);
-        }
-
-        // Sort target groups by target column (rightmost first = channel 1)
-        // Secondary sort by target row (lower row = closer = turns first)
-        const sortedGapGroups = Object.values(gapTargetGroups)
-            .sort((a, b) => {
-                if (b.target.column !== a.target.column) {
-                    return b.target.column - a.target.column;  // Rightmost first
-                }
-                return a.target.row - b.target.row;  // For ties, closer rows first
-            });
-
-        // Assign channels for this gap: rightmost target = channel 1
-        sortedGapGroups.forEach((group, index) => {
-            const channel = index + 1;
-            for (const conn of group.connections) {
-                if (!connectionGapChannels.has(conn)) {
-                    connectionGapChannels.set(conn, {});
-                }
-                connectionGapChannels.get(conn)[gapKey] = channel;
-            }
+    /**
+     * @brief Plans the section at one width with boundary ports at given Xs.
+     *
+     * A wire leaving the section for another box is routed to a boundary row
+     * like any other net, so it shares the section's tracks and corridors.
+     *
+     * @param {number} width - Content width.
+     * @param {Object} hints - Net key to fixed boundary port X, may be empty.
+     * @returns {Object} { plan, framed } with framed from frameBoundaryRows().
+     */
+    function planAt(width, hints) {
+        const framed = frameBoundaryRows(levelId, layoutRowsAt(width), width, hints);
+        const outside = boundaryConnections(levelId, framed.ids, id => sectionIds.has(id));
+        const plan = OrcaRouter.planSection({
+            rows: framed.rows,
+            connections: connections.concat(outside),
+            bounds: { minX: 0, maxX: width },
+            geometry: geometry
         });
+        return { plan: plan, framed: framed };
     }
 
-    // Step 4: Create routes and track port assignments
-    // Process downward connections first, then upward
-    for (const conn of allConnections) {
-        const isAligned = Math.abs(conn.source.column - conn.target.column) <= ALIGNMENT_TOLERANCE;
-        const routeIndex = routes.length;
-        const isUpward = conn.direction === 'up';
+    const hints = (levelId && BoundaryHints[levelId]) || {};
 
-        // Initialize port assignments for source node
-        if (!portAssignments[conn.source.id]) {
-            portAssignments[conn.source.id] = {
-                outgoing: [],           // Unidirectional outgoing (down) - each own port
-                incoming: [],           // Unidirectional incoming (down) - ALL share one port
-                bidirectionalOut: [],   // Bidirectional (as source, down) - each own port
-                bidirectionalIn: [],    // Bidirectional (as target, down) - each own port
-                outgoingTop: [],        // Upward outgoing - each own port
-                incomingBottom: [],     // Upward incoming - ALL share one port
-                bidirectionalOutTop: [],  // Upward bidirectional (as source) - each own port
-                bidirectionalInBottom: [] // Upward bidirectional (as target) - each own port
-            };
-        }
-
-        // Initialize port assignments for target node
-        if (!portAssignments[conn.target.id]) {
-            portAssignments[conn.target.id] = {
-                outgoing: [], incoming: [], bidirectionalOut: [], bidirectionalIn: [],
-                outgoingTop: [], incomingBottom: [], bidirectionalOutTop: [], bidirectionalInBottom: []
-            };
-        }
-
-        // Track port assignments based on direction and type
-        if (isUpward) {
-            // Upward connection: source exits from TOP, target receives at BOTTOM
-            if (conn.type === 'bidirectional') {
-                portAssignments[conn.source.id].bidirectionalOutTop.push({
-                    targetCol: conn.target.column,
-                    target: conn.target,
-                    source: conn.source,
-                    routeIndex: routeIndex
-                });
-                portAssignments[conn.target.id].bidirectionalInBottom.push({
-                    sourceCol: conn.source.column,
-                    source: conn.source,
-                    target: conn.target,
-                    routeIndex: routeIndex
-                });
-            } else {
-                portAssignments[conn.source.id].outgoingTop.push({
-                    targetCol: conn.target.column,
-                    target: conn.target,
-                    source: conn.source,
-                    routeIndex: routeIndex
-                });
-                portAssignments[conn.target.id].incomingBottom.push({
-                    sourceCol: conn.source.column,
-                    source: conn.source,
-                    target: conn.target,
-                    routeIndex: routeIndex
-                });
-            }
-        } else {
-            // Downward connection: source exits from BOTTOM, target receives at TOP
-            if (conn.type === 'bidirectional') {
-                portAssignments[conn.source.id].bidirectionalOut.push({
-                    targetCol: conn.target.column,
-                    target: conn.target,
-                    source: conn.source,
-                    routeIndex: routeIndex
-                });
-                portAssignments[conn.target.id].bidirectionalIn.push({
-                    sourceCol: conn.source.column,
-                    source: conn.source,
-                    target: conn.target,
-                    routeIndex: routeIndex
-                });
-            } else {
-                portAssignments[conn.source.id].outgoing.push({
-                    targetCol: conn.target.column,
-                    target: conn.target,
-                    source: conn.source,
-                    routeIndex: routeIndex
-                });
-                portAssignments[conn.target.id].incoming.push({
-                    sourceCol: conn.source.column,
-                    source: conn.source,
-                    target: conn.target,
-                    routeIndex: routeIndex
-                });
-            }
-        }
-
-        // Create the route
-        // gapChannels maps gap key to channel number for that gap
-        // e.g., { "1-2": 1, "2-3": 3 } for a connection spanning multiple gaps
-        routes.push({
-            from: conn.source,
-            to: conn.target,
-            type: conn.type,
-            dashed: conn.dashed,
-            isStraight: isAligned,
-            gapChannels: isAligned ? {} : (connectionGapChannels.get(conn) || {}),
-            sourceRow: conn.source.row,
-            targetRow: conn.target.row,
-            sharedSourceId: conn.source.id,
-            direction: conn.direction
-        });
+    // WHY: the default column pitch is node width plus 20, while a node blocks
+    // its width plus twice the 10px clearance. The two are equal, so every
+    // corridor between nodes came out zero wide, every crossing collapsed onto
+    // the section edge and pass-through wires landed on top of each other.
+    // The router reports the width its corridors need, so widen and replan
+    // until they fit.
+    const MAX_WIDTH_PASSES = 4;
+    let planned = null;
+    let plannedWidth = contentWidth;
+    for (let pass = 0; pass < MAX_WIDTH_PASSES; pass++) {
+        planned = planAt(contentWidth, hints);
+        plannedWidth = contentWidth;
+        if (planned.plan.requiredContentWidth <= contentWidth + 0.5) break;
+        contentWidth = Math.ceil(planned.plan.requiredContentWidth);
     }
 
-    // =========================================================================
-    // Calculate port offsets for each route based on port ordering
-    //
-    // Port count formula per edge:
-    //   ports = outgoing_count + bidirectional_count + min(1, incoming_count)
-    //
-    // Key rules:
-    // - Each outgoing connection gets its OWN port
-    // - Each bidirectional connection gets its OWN port (on both source and target)
-    // - ALL unidirectional incoming connections share ONE port (merge with junction dots)
-    //
-    // Bottom edge: outgoing + bidirectionalOut + bidirectionalInBottom + incomingBottom(shared)
-    // Top edge: incoming(shared) + bidirectionalIn + bidirectionalOutTop + outgoingTop
-    // =========================================================================
-    const portSpacing = 12;  // Pixels between ports
+    // WHY: the last pass can widen without planning again, which left the
+    // wires routed at the old width while the nodes moved to the new one.
+    if (plannedWidth !== contentWidth) planned = planAt(contentWidth, hints);
 
-    for (const nodeId in portAssignments) {
-        const ports = portAssignments[nodeId];
+    // Keep node.localX in step with the width the final plan was built at.
+    layoutRowsAt(contentWidth);
 
-        // =====================================================================
-        // BOTTOM EDGE: Ports leaving or entering from below
-        // - outgoing (down): each own port
-        // - bidirectionalOut (down): each own port (source side of bidirectional)
-        // - bidirectionalInBottom (up): each own port (target side of upward bidirectional)
-        // - incomingBottom (up): ALL share one port (unidirectional incoming from below)
-        //
-        // Uses 5-set algorithm for optimal port ordering to minimize wire crossings
-        // =====================================================================
+    const plan = planned.plan;
+    const framed = planned.framed;
+    const rowCount = framed.rows.length;
+    console.assert(framed.firstContentRow + sectionLayout.rows.length <= rowCount,
+        'node rows must fit inside the framed rows');
 
-        // Find the center node (the node whose ports we're calculating)
-        let centerNode = null;
-        if (ports.outgoing.length > 0) centerNode = ports.outgoing[0].source;
-        else if (ports.bidirectionalOut.length > 0) centerNode = ports.bidirectionalOut[0].source;
-        else if (ports.bidirectionalInBottom.length > 0) centerNode = ports.bidirectionalInBottom[0].target;
-        else if (ports.incomingBottom.length > 0) centerNode = ports.incomingBottom[0].target;
-        else if (ports.incoming.length > 0) centerNode = ports.incoming[0].target;
-        else if (ports.bidirectionalIn.length > 0) centerNode = ports.bidirectionalIn[0].target;
-        else if (ports.bidirectionalOutTop.length > 0) centerNode = ports.bidirectionalOutTop[0].source;
-        else if (ports.outgoingTop.length > 0) centerNode = ports.outgoingTop[0].source;
-
-        const bottomEdgePorts = [];
-
-        // Add outgoing ports (going down) - each gets own port
-        // "Other" node is the target
-        for (const port of ports.outgoing) {
-            bottomEdgePorts.push({
-                routeIndices: [port.routeIndex],
-                otherCol: port.targetCol,
-                otherNode: port.target,
-                type: 'sourcePortOffset',
-                isShared: false
-            });
-        }
-
-        // Add bidirectional outgoing (going down) - each gets own port
-        for (const port of ports.bidirectionalOut) {
-            bottomEdgePorts.push({
-                routeIndices: [port.routeIndex],
-                otherCol: port.targetCol,
-                otherNode: port.target,
-                type: 'sourcePortOffset',
-                isShared: false
-            });
-        }
-
-        // Add bidirectional incoming bottom (coming up) - each gets own port
-        // "Other" node is the source
-        for (const port of ports.bidirectionalInBottom) {
-            bottomEdgePorts.push({
-                routeIndices: [port.routeIndex],
-                otherCol: port.sourceCol,
-                otherNode: port.source,
-                type: 'targetPortOffset',
-                isShared: false
-            });
-        }
-
-        // Add unidirectional incoming bottom ports (coming up) - ALL share ONE port
-        if (ports.incomingBottom.length > 0) {
-            const routeIndices = ports.incomingBottom.map(p => p.routeIndex);
-            const avgSourceCol = ports.incomingBottom.reduce((sum, p) => sum + p.sourceCol, 0)
-                / ports.incomingBottom.length;
-
-            bottomEdgePorts.push({
-                routeIndices: routeIndices,
-                otherCol: avgSourceCol,
-                otherNode: null,  // Shared port - no single "other" node
-                type: 'targetPortOffset',
-                isShared: true,
-                isDifferentRow: true  // Incoming from below = different row
-            });
-        }
-
-        // Sort bottom edge ports using 5-set algorithm if we have the center node
-        if (centerNode && bottomEdgePorts.length > 1) {
-            const sortedPorts = sortPortsForEdge(centerNode, bottomEdgePorts, sectionLayout);
-            bottomEdgePorts.length = 0;
-            bottomEdgePorts.push(...sortedPorts);
-        } else {
-            // Fallback to simple column sort
-            bottomEdgePorts.sort((a, b) => a.otherCol - b.otherCol);
-        }
-
-        // Calculate offsets for all bottom edge ports
-        const bottomCount = bottomEdgePorts.length;
-        bottomEdgePorts.forEach((port, i) => {
-            const offset = bottomCount > 1 ? (2 * i - bottomCount + 1) * portSpacing / 2 : 0;
-            for (const routeIndex of port.routeIndices) {
-                routes[routeIndex][port.type] = offset;
-            }
-        });
-
-        // =====================================================================
-        // TOP EDGE: Ports leaving or entering from above
-        // - incoming (down): ALL share one port (unidirectional incoming from above)
-        // - bidirectionalIn (down): each own port (target side of downward bidirectional)
-        // - bidirectionalOutTop (up): each own port (source side of upward bidirectional)
-        // - outgoingTop (up): each own port
-        //
-        // Uses 5-set algorithm for optimal port ordering to minimize wire crossings
-        // =====================================================================
-        const topEdgePorts = [];
-
-        // Add unidirectional incoming ports (coming down) - ALL share ONE port
-        if (ports.incoming.length > 0) {
-            const routeIndices = ports.incoming.map(p => p.routeIndex);
-            const avgSourceCol = ports.incoming.reduce((sum, p) => sum + p.sourceCol, 0)
-                / ports.incoming.length;
-
-            topEdgePorts.push({
-                routeIndices: routeIndices,
-                otherCol: avgSourceCol,
-                otherNode: null,  // Shared port - no single "other" node
-                type: 'targetPortOffset',
-                isShared: true,
-                isDifferentRow: true  // Incoming from above = different row
-            });
-        }
-
-        // Add bidirectional incoming (coming down) - each gets own port
-        // "Other" node is the source
-        for (const port of ports.bidirectionalIn) {
-            topEdgePorts.push({
-                routeIndices: [port.routeIndex],
-                otherCol: port.sourceCol,
-                otherNode: port.source,
-                type: 'targetPortOffset',
-                isShared: false
-            });
-        }
-
-        // Add bidirectional outgoing top (going up) - each gets own port
-        // "Other" node is the target
-        for (const port of ports.bidirectionalOutTop) {
-            topEdgePorts.push({
-                routeIndices: [port.routeIndex],
-                otherCol: port.targetCol,
-                otherNode: port.target,
-                type: 'sourcePortOffset',
-                isShared: false
-            });
-        }
-
-        // Add outgoing top ports (going up) - each gets own port
-        for (const port of ports.outgoingTop) {
-            topEdgePorts.push({
-                routeIndices: [port.routeIndex],
-                otherCol: port.targetCol,
-                otherNode: port.target,
-                type: 'sourcePortOffset',
-                isShared: false
-            });
-        }
-
-        // Sort top edge ports using 5-set algorithm if we have the center node
-        if (centerNode && topEdgePorts.length > 1) {
-            const sortedPorts = sortPortsForEdge(centerNode, topEdgePorts, sectionLayout);
-            topEdgePorts.length = 0;
-            topEdgePorts.push(...sortedPorts);
-        } else {
-            // Fallback to simple column sort
-            topEdgePorts.sort((a, b) => a.otherCol - b.otherCol);
-        }
-
-        // Calculate offsets for all top edge ports
-        const topCount = topEdgePorts.length;
-        topEdgePorts.forEach((port, i) => {
-            const offset = topCount > 1 ? (2 * i - topCount + 1) * portSpacing / 2 : 0;
-            // Apply offset to all routes using this port
-            for (const routeIndex of port.routeIndices) {
-                routes[routeIndex][port.type] = offset;
-            }
-        });
+    /**
+     * @brief True for a gap that runs along a boundary row.
+     * @param {number} g - Gap index.
+     * @returns {boolean} Whether the gap borders the box edge.
+     */
+    function isBoundaryGap(g) {
+        return (framed.hasTop && g === 0) || (framed.hasBottom && g === rowCount - 2);
     }
 
-    return routes;
+    // Only the gaps between node rows share the diagram's uniform pitch. A
+    // boundary gap holds just the wires leaving the box, so it is sized alone.
+    let innerTracks = 0;
+    plan.gapTrackCounts.forEach((tracks, g) => {
+        if (!isBoundaryGap(g)) innerTracks = Math.max(innerTracks, tracks);
+    });
+    const ownGapHeight = OrcaRouter.gapHeightForTracks(innerTracks, plan.geometry);
+    const gapHeight = Math.max(uniformGapHeight, ownGapHeight);
+
+    // A same-row wire in the last row routes through a gap below it, so the
+    // section reserves that trailing gap when the plan uses one.
+    const rowOffsets = [];
+    const rowHeights = [];
+    const gapHeights = [];
+    let cursorY = 0;
+    for (let r = 0; r < rowCount; r++) {
+        const isBoundaryRow = (framed.hasTop && r === 0) || (framed.hasBottom && r === rowCount - 1);
+        rowOffsets.push(cursorY);
+        rowHeights.push(isBoundaryRow ? 0 : nodeHeight);
+        cursorY += rowHeights[r];
+        if (r < plan.gapTrackCounts.length) {
+            const gap = isBoundaryGap(r)
+                ? OrcaRouter.gapHeightForTracks(plan.gapTrackCounts[r], plan.geometry)
+                : gapHeight;
+            gapHeights.push(gap);
+            cursorY += gap;
+        }
+    }
+    const contentHeight = cursorY;
+    console.assert(rowHeights.length === rowCount && gapHeights.length === plan.gapTrackCounts.length,
+        'every plan row and gap must have a reserved size');
+
+    // A bottom boundary row sits on the box edge, so the gap above it takes
+    // the place of the bottom padding.
+    const bottomPadding = framed.hasBottom ? 0 : SECTION_BOTTOM_PADDING;
+
+    const bundle = {
+        sectionKey: sectionKey,
+        levelId: levelId,
+        sectionLayout: sectionLayout,
+        plan: plan,
+        contentWidth: contentWidth,
+        nodeHeight: nodeHeight,
+        gapHeight: gapHeight,
+        gapHeights: gapHeights,
+        rowOffsets: rowOffsets,
+        rowHeights: rowHeights,
+        firstContentRow: framed.firstContentRow,
+        hasBoundary: framed.hasTop || framed.hasBottom,
+        contentHeight: contentHeight,
+        totalHeight: SECTION_LABEL_HEIGHT + contentHeight + bottomPadding,
+        // Routes the section again at its sized width once the level above
+        // has fixed the boundary port Xs. The rows keep their shape, so the
+        // reserved geometry still applies.
+        replan: newHints => planAt(contentWidth, newHints).plan
+    };
+
+    SectionPlanCache[cacheKey] = bundle;
+    return bundle;
 }
 
 /**
- * @brief Renders nodes within a section as SVG elements.
+ * @brief Splits every connection into the pieces each routing level must draw.
  *
- * Node height is calculated based on text content (heading + optional hint),
- * not based on available section space. This produces compact diagrams.
+ * A connection whose endpoints sit in one section is left alone, because
+ * planSection() already routes it. Everything else is decomposed against the
+ * layout tree, which yields one piece per container boundary the wire crosses.
  *
- * Node placement uses the column positioning formula:
- *   column = (2k - 1) / (2n) for k in [1..n]
+ * This is the plan phase's first step and needs no geometry, so it runs before
+ * anything is sized or placed.
  *
- * Vertical spacing between rows accounts for:
- *   - Grid routing channels (for wire paths)
- *   - Minimum row spacing (20px)
- *   - Spacing is only added BETWEEN rows, not after the last row
+ * @pre nodesData must have been parsed with the same layout tree.
  *
- * Each rendered node stores its pixel position for connection routing:
- *   node.pixelX, node.pixelY, node.pixelWidth, node.pixelHeight
- *
- * @pre sectionLayout must contain rows array with nodes and gridHeights array
- * @pre bounds.y must already account for section label offset (set in renderLayoutNode)
- * @pre style must contain font-size, hint-size, node-padding, node-min-width, node-radius
- *
- * @param {Object} sectionLayout - Layout data from calculateSectionLayout with rows and gridHeights.
- * @param {Object} bounds - Section bounds { x, y, width, height } where y is after label.
- * @param {Object} style - Style configuration with sizing and font parameters.
- * @param {string} color - Section color for node borders.
- * @returns {string} SVG markup for all nodes in the section.
+ * @param {Object} layoutTree - Parsed layout tree, may be null.
+ * @param {Object} nodesData - Parsed nodes data.
+ * @returns {Object} { tree, byLevel, errors } where byLevel maps a box id to
+ *                   the pieces that level routes.
  */
-function renderNodesInSection(sectionLayout, bounds, style, color) {
-    if (!sectionLayout || sectionLayout.rows.length === 0) return '';
+function planLevels(layoutTree, nodesData) {
+    const sectionKeys = Object.keys(nodesData.sections);
+    const tree = OrcaLevels.buildLevelTree(layoutTree, sectionKeys);
+    const byLevel = {};
+    const errors = [];
 
+    if (!tree.root) return { tree: tree, byLevel: byLevel, errors: errors };
+
+    /**
+     * @brief Describes one connection end the way decomposeNet expects.
+     * @param {string} id - Node id, or section name for a section endpoint.
+     * @param {string} kind - 'section' when the end is a box, else a node.
+     * @returns {Object|null} Endpoint descriptor, or null when unresolvable.
+     */
+    function endpointFor(id, kind) {
+        if (kind === 'section') return { kind: 'section', id: id };
+        const node = nodesData.nodeMap[id];
+        if (!node || !node.section) return null;
+        return { kind: 'node', id: id, sectionKey: node.section };
+    }
+
+    nodesData.connections.forEach((conn, connIndex) => {
+        const from = endpointFor(conn.from, conn.fromKind);
+        const to = endpointFor(conn.to, conn.toKind);
+        if (!from || !to) return;
+
+        // Both ends in one section is the ordinary case and is already routed.
+        if (from.kind === 'node' && to.kind === 'node'
+            && from.sectionKey === to.sectionKey) {
+            return;
+        }
+
+        const result = OrcaLevels.decomposeNet(from, to, tree);
+        if (result.error) {
+            errors.push(result.error);
+            return;
+        }
+        for (const piece of result.pieces) {
+            if (!byLevel[piece.levelId]) byLevel[piece.levelId] = [];
+            byLevel[piece.levelId].push({
+                // One key per connection, shared by all of its pieces, which
+                // is how a port on one side of a box edge finds the other.
+                key: 'n' + connIndex,
+                connection: conn,
+                from: piece.from,
+                to: piece.to,
+                pieceCount: result.pieces.length
+            });
+        }
+    });
+
+    // Net keys per level, so asking whether a wire carries on inside a box
+    // is a lookup rather than a scan.
+    const keysByLevel = {};
+    for (const levelId in byLevel) {
+        keysByLevel[levelId] = new Set(byLevel[levelId].map(piece => piece.key));
+    }
+
+    const levels = { tree: tree, byLevel: byLevel, keysByLevel: keysByLevel, errors: errors, sides: {} };
+    levels.sides = planBoundarySides(levels);
+    return levels;
+}
+
+/**
+ * @brief Picks the edge, top or bottom, each wire uses to cross each box edge.
+ *
+ * This is topology only. The router sends a wire out of the bottom of a row
+ * and into the top of a lower one, and runs a same-row wire under its row, so
+ * the edge follows from row indices alone and needs no geometry. That is what
+ * lets every level reserve its boundary rows before anything is sized.
+ *
+ * The parent level decides, so levels are visited parents first. Walked with
+ * an explicit stack rather than by recursion, per P10 rule 1.
+ *
+ * @param {Object} levels - { tree, byLevel } from planLevels().
+ * @returns {Object} Map of level id to a map of net key to 'top' or 'bottom'.
+ */
+function planBoundarySides(levels) {
+    const sides = {};
+    const tree = levels.tree;
+    if (!tree.root) return sides;
+    console.assert(tree.boxes[tree.root.id] === tree.root, 'the root must be in the tree');
+
+    const stack = [tree.root];
+    let guard = 0;
+
+    while (stack.length > 0 && guard < MAX_LAYOUT_NODES) {
+        guard++;
+        const box = stack.pop();
+        for (const child of box.children) stack.push(child);
+        if (box.kind !== 'container') continue;
+
+        const own = sides[box.id] || {};
+        const contentRows = box.direction === 'column' ? box.children.length : 1;
+        const rowOf = {};
+        box.children.forEach((child, i) => {
+            rowOf[child.id] = box.direction === 'column' ? i : 0;
+        });
+
+        /**
+         * @brief Router row of one piece end, with boundaries outside the rows.
+         * @param {Object} end - Piece end { kind, id }.
+         * @param {string} key - Net key of the piece.
+         * @returns {number|undefined} Row index, or undefined if unplaced.
+         */
+        function endRow(end, key) {
+            if (end.kind === 'boundary') return own[key] === 'top' ? -1 : contentRows;
+            return rowOf[end.id];
+        }
+
+        for (const piece of levels.byLevel[box.id] || []) {
+            const fromRow = endRow(piece.from, piece.key);
+            const toRow = endRow(piece.to, piece.key);
+            if (fromRow === undefined || toRow === undefined) continue;
+
+            // The same rule OrcaRouter's decomposeNet applies to row indices.
+            let fromEdge = 'bottom';
+            let toEdge = 'bottom';
+            if (fromRow < toRow) toEdge = 'top';
+            if (fromRow > toRow) fromEdge = 'top';
+
+            for (const [end, edge] of [[piece.from, fromEdge], [piece.to, toEdge]]) {
+                if (end.kind !== 'box') continue;
+                if (!sides[end.id]) sides[end.id] = {};
+                sides[end.id][piece.key] = edge;
+            }
+        }
+    }
+
+    console.assert(guard < MAX_LAYOUT_NODES, 'boundary side walk hit its bound');
+    return sides;
+}
+
+/**
+ * @brief Lists the nets that leave a level through its top and bottom edges.
+ *
+ * @param {string|null} levelId - Level box id, or null when there is none.
+ * @returns {Object} { top, bottom }, each an array of net keys.
+ */
+function boundaryKeys(levelId) {
+    console.assert(levelId === null || typeof levelId === 'string', 'levelId must be a box id');
+    const keys = { top: [], bottom: [] };
+    if (!ActiveLevels || !levelId) return keys;
+
+    const own = ActiveLevels.sides[levelId] || {};
+    for (const piece of ActiveLevels.byLevel[levelId] || []) {
+        if (piece.from.kind !== 'boundary' && piece.to.kind !== 'boundary') continue;
+        keys[own[piece.key] === 'top' ? 'top' : 'bottom'].push(piece.key);
+    }
+    return keys;
+}
+
+/**
+ * @brief Frames a level's rows with the boundary rows its nets leave through.
+ *
+ * A boundary row has zero height and sits first or last. Once the level above
+ * has fixed where each wire crosses the box edge, the row holds one zero-width
+ * node per wire at exactly that X, and assignPorts() puts the port there with
+ * no new router code. Before that, one node spans the row and the ports fan
+ * out along it, which is close enough to size the box by.
+ *
+ * @param {string|null} levelId - Level box id.
+ * @param {Array} contentRows - The level's own rows, in planSection() shape.
+ * @param {number} width - Content width of the level.
+ * @param {Object} hints - Map of net key to fixed port X, may be empty.
+ * @returns {Object} { rows, ids, firstContentRow, hasTop, hasBottom } where
+ *                   ids maps a net key to its boundary node id.
+ */
+function frameBoundaryRows(levelId, contentRows, width, hints) {
+    console.assert(Array.isArray(contentRows), 'contentRows must be an array');
+    console.assert(width > 0, 'a level needs a positive width');
+
+    const keys = boundaryKeys(levelId);
+    const ids = {};
+
+    /**
+     * @brief Builds one boundary row for one edge.
+     * @param {string} side - 'top' or 'bottom'.
+     * @param {Array} netKeys - Nets crossing that edge.
+     * @returns {Object} A row in planSection() shape.
+     */
+    function boundaryRow(side, netKeys) {
+        // A net the level above has placed is pinned on its own. Only the
+        // rest share one spanning node, so one missing hint cannot unpin the
+        // whole edge.
+        const nodes = [];
+        let spanning = false;
+        for (const key of netKeys) {
+            if (typeof hints[key] === 'number') {
+                ids[key] = 'bnd:' + key;
+                nodes.push({ id: 'bnd:' + key, boundary: true, centreX: hints[key], width: 0 });
+            } else {
+                ids[key] = 'bnd:' + side;
+                spanning = true;
+            }
+        }
+        if (spanning) {
+            nodes.push({ id: 'bnd:' + side, boundary: true, centreX: width / 2, width: width });
+        }
+        return { nodes: nodes };
+    }
+
+    const rows = [];
+    if (keys.top.length > 0) rows.push(boundaryRow('top', keys.top));
+    for (const row of contentRows) rows.push(row);
+    if (keys.bottom.length > 0) rows.push(boundaryRow('bottom', keys.bottom));
+
+    return {
+        rows: rows,
+        ids: ids,
+        firstContentRow: keys.top.length > 0 ? 1 : 0,
+        hasTop: keys.top.length > 0,
+        hasBottom: keys.bottom.length > 0
+    };
+}
+
+/**
+ * @brief True when a wire reaching a child box carries on inside it.
+ * @param {Object} end - Piece end { kind, id }.
+ * @param {string} key - Net key.
+ * @returns {boolean} Whether the child routes a piece of the same net.
+ */
+function continuesInside(end, key) {
+    if (end.kind !== 'box' || !ActiveLevels) return false;
+    const keys = ActiveLevels.keysByLevel[end.id];
+    return !!keys && keys.has(key);
+}
+
+/**
+ * @brief Turns the pieces one level routes into planSection() connections.
+ *
+ * A wire that reaches a child box and carries on inside it is marked at that
+ * end, so it keeps its own port, never joins a merge bus and takes no arrow.
+ *
+ * @param {string|null} levelId - Level box id.
+ * @param {Object} ids - Net key to boundary node id, from frameBoundaryRows().
+ * @param {Function} accept - Returns true for a piece end id this level holds.
+ * @returns {Array} Connections keyed by net key.
+ */
+function boundaryConnections(levelId, ids, accept) {
+    console.assert(ids && typeof accept === 'function', 'boundaryConnections needs ids and a filter');
+    if (!ActiveLevels || !levelId) return [];
+
+    /**
+     * @brief Resolves one piece end to a node id in this level's rows.
+     * @param {Object} end - Piece end { kind, id }.
+     * @param {string} key - Net key.
+     * @returns {string|null} Node id, or null when the level does not hold it.
+     */
+    function endId(end, key) {
+        if (end.kind === 'boundary') return ids[key] || null;
+        return accept(end.id) ? end.id : null;
+    }
+
+    const connections = [];
+    for (const piece of ActiveLevels.byLevel[levelId] || []) {
+        const from = endId(piece.from, piece.key);
+        const to = endId(piece.to, piece.key);
+        if (!from || !to) continue;
+
+        connections.push({
+            id: piece.key,
+            from: from,
+            to: to,
+            type: piece.connection.type,
+            dashed: !!piece.connection.dashed,
+            continuesFrom: continuesInside(piece.from, piece.key),
+            continuesTo: continuesInside(piece.to, piece.key)
+        });
+    }
+    return connections;
+}
+
+/**
+ * @brief Checks a replanned level still fits the room its box reserved.
+ *
+ * @param {Object} plan - Result of planSection().
+ * @param {Array} gapHeights - Reserved height of each gap.
+ * @param {number} width - Reserved content width, or Infinity to skip.
+ * @returns {boolean} True when every gap and the width suffice.
+ */
+function planFits(plan, gapHeights, width) {
+    console.assert(plan && Array.isArray(plan.gapTrackCounts), 'planFits needs a plan');
+    if (plan.requiredContentWidth > width + 0.5) return false;
+    if (plan.gapTrackCounts.length > gapHeights.length) return false;
+    return plan.gapTrackCounts.every((tracks, g) =>
+        tracks === 0
+        || OrcaRouter.gapHeightForTracks(tracks, plan.geometry) <= gapHeights[g] + 0.5);
+}
+
+/**
+ * @brief Builds the geometry settings one gutter level routes with.
+ *
+ * @param {Object} style - Style configuration.
+ * @returns {Object} Geometry for planSection() and emitSection().
+ */
+function gutterGeometry(style) {
+    return {
+        // Row thickness varies box by box at a gutter level, so emitSection()
+        // is given the heights directly and this value is never used.
+        nodeHeight: 0,
+        hTrackPitch: style['line-spacing'] || 15,
+        clearance: 10,
+        portPitch: 12,
+        portInset: 8,
+        arrowClearance: 12,
+        cornerRadius: style['corner-radius'] !== undefined ? style['corner-radius'] : 4
+    };
+}
+
+/**
+ * @brief Plans one container level, and with it the gutters it has to carry.
+ *
+ * A container routes among its child boxes exactly as a section routes among
+ * its nodes, so the same planSection() does both. A row container gives the
+ * router one row of boxes and a channel below it; a column container gives it
+ * one box per row and the gaps between them.
+ *
+ * The result also owns the container's own size, because a gutter has to be as
+ * wide as the tracks it carries. The sizing pass and the placement pass both
+ * read it, which is what stops them drifting apart.
+ *
+ * @pre childSizes must come from calculateNodeContentSize() for these children.
+ *
+ * @param {Object} node - Layout tree node for the container.
+ * @param {Array} childSizes - { width, height } of each child, in order.
+ * @param {Object} style - Style configuration.
+ * @returns {Object} Layout and plan for this level, described field by field
+ *                   in the object literal below.
+ */
+function getGutterPlan(node, childSizes, style) {
+    console.assert(childSizes.length > 0, 'a container must have children');
+
+    const levelBox = ActiveLevels ? ActiveLevels.tree.byNode.get(node) : null;
+    const cacheKey = levelBox ? levelBox.id : null;
+    if (cacheKey && GutterPlanCache[cacheKey]) return GutterPlanCache[cacheKey];
+
+    const direction = node.direction || 'row';
+    const geometry = gutterGeometry(style);
+    const childIds = childSizes.map((_, i) => levelBox ? levelBox.children[i].id : 'child' + i);
+    const childIndex = {};
+    childIds.forEach((id, i) => { childIndex[id] = i; });
+
+    // A wire that skips a row has to pass beside the boxes between, and a
+    // column of boxes fills the level's width, so the room has to be reserved.
+    // A boundary sits outside every row, above the first or below the last.
+    let sideChannel = 0;
+    if (direction === 'column' && cacheKey) {
+        const sides = ActiveLevels.sides[cacheKey] || {};
+        let skipping = 0;
+
+        /**
+         * @brief Column row of one piece end.
+         * @param {Object} end - Piece end { kind, id }.
+         * @param {string} key - Net key.
+         * @returns {number} Row index, with boundaries outside the column.
+         */
+        function rowOfEnd(end, key) {
+            if (end.kind === 'boundary') return sides[key] === 'top' ? -1 : childSizes.length;
+            return childIndex[end.id];
+        }
+
+        for (const piece of ActiveLevels.byLevel[cacheKey] || []) {
+            const a = rowOfEnd(piece.from, piece.key);
+            const b = rowOfEnd(piece.to, piece.key);
+            if (a !== undefined && b !== undefined && Math.abs(a - b) > 1) skipping++;
+        }
+        if (skipping > 0) {
+            // WHY: the corridor is the channel less one clearance, and it has
+            // to hold one pitch more than its tracks. Sized at two clearances
+            // plus the tracks it came out 4px short, below one usable track,
+            // so every crossing fell back to the left channel at a squeezed
+            // pitch.
+            sideChannel = geometry.clearance + (skipping + 1) * OrcaRouter.DEFAULT_GEOMETRY.vTrackPitch;
+        }
+    }
+
+    const childOffsets = [];
+    const childWidths = [];
+    const contentRowHeights = [];
+    let contentRows = [];
+    let contentWidth = 0;
+
+    if (direction === 'row') {
+        const boxes = [];
+        let cursor = sideChannel;
+
+        childSizes.forEach((size, i) => {
+            childOffsets.push(cursor);
+            childWidths.push(size.width);
+            boxes.push({ id: childIds[i], centreX: cursor + size.width / 2, width: size.width });
+            cursor += size.width + LAYOUT_GUTTER;
+        });
+
+        contentRows = [{ nodes: boxes }];
+        contentRowHeights.push(Math.max(...childSizes.map(s => s.height)));
+        contentWidth = cursor - LAYOUT_GUTTER + sideChannel;
+    } else {
+        const columnWidth = Math.max(...childSizes.map(s => s.width));
+
+        contentRows = childSizes.map((size, i) => {
+            childOffsets.push(sideChannel);
+            childWidths.push(columnWidth);
+            contentRowHeights.push(size.height);
+            return {
+                nodes: [{ id: childIds[i], centreX: sideChannel + columnWidth / 2, width: columnWidth }]
+            };
+        });
+        contentWidth = columnWidth + sideChannel * 2;
+    }
+
+    /**
+     * @brief Plans the level with its boundary ports at the given Xs.
+     * @param {Object} hints - Net key to fixed boundary port X, may be empty.
+     * @returns {Object} { plan, framed }, where plan is null with no nets.
+     */
+    function planWith(hints) {
+        const framed = frameBoundaryRows(cacheKey, contentRows, contentWidth, hints);
+        const connections = boundaryConnections(cacheKey, framed.ids,
+            id => childIndex[id] !== undefined);
+        if (connections.length === 0) return { plan: null, framed: framed };
+
+        const plan = OrcaRouter.planSection({
+            rows: framed.rows,
+            connections: connections,
+            bounds: { minX: 0, maxX: contentWidth },
+            geometry: geometry
+        });
+        return { plan: plan, framed: framed };
+    }
+
+    const planned = planWith((cacheKey && BoundaryHints[cacheKey]) || {});
+    const plan = planned.plan;
+    const framed = planned.framed;
+    const rowCount = framed.rows.length;
+
+    const rowHeights = [];
+    for (let r = 0; r < rowCount; r++) {
+        const c = r - framed.firstContentRow;
+        rowHeights.push(c >= 0 && c < contentRows.length ? contentRowHeights[c] : 0);
+    }
+
+    // One gap below every row but the last, plus a trailing one when a wire
+    // between two boxes of the same row has to run under them.
+    const gapCount = plan && plan.hasTrailingGap ? rowCount : rowCount - 1;
+    const gapHeights = [];
+    for (let g = 0; g < gapCount; g++) {
+        const tracks = plan && plan.gapTrackCounts ? (plan.gapTrackCounts[g] || 0) : 0;
+        const needed = tracks > 0 ? OrcaRouter.gapHeightForTracks(tracks, geometry) : 0;
+        gapHeights.push(Math.max(LAYOUT_GUTTER, needed));
+    }
+
+    // Row tops and the level's own height come out of the same walk, so the
+    // height reserved is exactly the height the boxes and wires occupy.
+    const rowOffsets = [];
+    let cursorY = 0;
+    for (let i = 0; i < rowCount; i++) {
+        rowOffsets.push(cursorY);
+        cursorY += rowHeights[i] + (gapHeights[i] || 0);
+    }
+
+    const bundle = {
+        levelId: cacheKey,
+        direction: direction,
+        sideChannel: sideChannel,
+        childOffsets: childOffsets,
+        childWidths: childWidths,
+        rowOffsets: rowOffsets,
+        rowHeights: rowHeights,
+        gapHeights: gapHeights,
+        firstContentRow: framed.firstContentRow,
+        hasBoundary: framed.hasTop || framed.hasBottom,
+        contentWidth: contentWidth,
+        contentHeight: cursorY,
+        geometry: geometry,
+        plan: plan,
+        // Routes the level again once the level above has fixed its boundary
+        // port Xs. The rows keep their shape, so the reserved room applies.
+        replan: hints => planWith(hints).plan
+    };
+
+    if (cacheKey) GutterPlanCache[cacheKey] = bundle;
+    return bundle;
+}
+
+/**
+ * @brief Finds the gap height that every section in the diagram should use.
+ *
+ * Rows line up across the whole page only when every gap is the same height,
+ * so the densest gap anywhere sets the pitch for all of them.
+ *
+ * @param {Object} layoutTree - Parsed layout tree.
+ * @param {Object} nodesData - Parsed nodes data.
+ * @param {Object} style - Style configuration.
+ * @returns {number} Uniform gap height in pixels.
+ */
+function calculateUniformGapHeight(layoutTree, nodesData, style) {
+    let tallest = 0;
+
+    /**
+     * @brief Visits one layout node, recording the gap height it needs.
+     * @param {Object} node - Layout tree node.
+     * @param {string} parentName - Enclosing segment name, for section lookup.
+     * @returns {void}
+     */
+    function visit(node, parentName) {
+        if (!node) return;
+
+        if (node.children && node.children.length > 0) {
+            const childParent = node.type === 'segment' ? node.name : parentName;
+            for (const child of node.children) visit(child, childParent);
+            return;
+        }
+
+        if (node.type !== 'segment') return;
+
+        let sectionKey = parentName ? parentName + ':' + node.name : node.name;
+        if (!nodesData.sections[sectionKey] && parentName) sectionKey = node.name;
+        if (!nodesData.sections[sectionKey]) return;
+
+        const bundle = getSectionPlan(nodesData, sectionKey, style, 0);
+        if (bundle) tallest = Math.max(tallest, bundle.gapHeight);
+    }
+
+    visit(layoutTree, null);
+    return tallest;
+}
+
+// =============================================================================
+// 7. SECTION RENDERING
+// =============================================================================
+
+/**
+ * @brief Renders one section's nodes and wires from its plan.
+ *
+ * The plan is built in section-local coordinates, so everything is translated
+ * by a single offset here. Content narrower than its box is centred, which
+ * keeps node columns lining up between sections of the same content width.
+ *
+ * @pre bundle must come from getSectionPlan().
+ *
+ * @param {Object} bundle - Plan bundle for the section.
+ * @param {Object} bounds - Section content box { x, y, width, height }.
+ * @param {Object} edges - Page Y { top, bottom } of the section box edges.
+ * @param {Object} style - Style configuration.
+ * @param {string} color - Stroke colour for this section.
+ * @returns {string} SVG markup for the section's nodes and wires.
+ */
+function renderSection(bundle, bounds, edges, style, color) {
+    const { sectionLayout, plan, nodeHeight } = bundle;
+    console.assert(bundle.rowOffsets.length === plan.rows.length, 'one offset per plan row');
+    const offsetX = sectionOriginX(bundle, bounds);
+
+    // Plan rows include any boundary rows; node rows start after the top one.
+    const planRowTops = bundle.rowOffsets.map(offset => bounds.y + offset);
+    const rowTops = sectionLayout.rows.map((_, i) => planRowTops[bundle.firstContentRow + i]);
+
+    const emitted = OrcaRouter.emitSection(plan, planRowTops, bundle.rowHeights);
+    stretchBoundaryEnds(emitted, plan, edges);
+
+    // Record the no-overlap check so the headless harness can assert on the
+    // real render rather than only on fixtures. Both checks are quadratic in
+    // the segment count, so they stay off unless a harness asks for them by
+    // setting window.ORCA_VERIFY before generating.
+    if (typeof window !== 'undefined' && window.ORCA_VERIFY) {
+        if (!window.OrcaCheck) window.OrcaCheck = { sections: [] };
+        const nodeBoxes = [];
+        sectionLayout.rows.forEach((row, i) => {
+            for (const node of row.nodes) {
+                nodeBoxes.push({
+                    id: node.id,
+                    x0: node.localX - node.pixelWidth / 2,
+                    y0: rowTops[i],
+                    x1: node.localX + node.pixelWidth / 2,
+                    y1: rowTops[i] + nodeHeight
+                });
+            }
+        });
+        window.OrcaCheck.sections.push({
+            section: bundle.sectionKey,
+            nets: plan.nets.length,
+            tracksPerGap: plan.gapTrackCounts,
+            overlaps: OrcaRouter.findOverlaps(emitted.segments, 1.0).length,
+            nodeHits: OrcaRouter.findNodeCollisions(emitted.segments, nodeBoxes, 1.0).length
+        });
+        recordJoinEnds(emitted, plan, offsetX, () => false);
+    }
+
+    const lineThickness = style['line-thickness'] || 2;
+    const cornerRadius = plan.geometry.cornerRadius;
+    const arrowSize = 8;
+    const junctionRadius = 4;
+
+    let svg = '<g transform="translate(' + offsetX + ',0)">';
+
+    for (const line of emitted.polylines) {
+        const d = OrcaRouter.pathData(line.points, cornerRadius);
+        svg += '<path d="' + d + '" fill="none" stroke="' + color + '"'
+            + ' stroke-width="' + lineThickness + '"'
+            + ' stroke-linecap="round" stroke-linejoin="round"'
+            + (line.dashed ? ' stroke-dasharray="5,5"' : '') + '/>';
+    }
+
+    for (const dot of emitted.junctions) {
+        svg += '<circle cx="' + dot.x + '" cy="' + dot.y + '" r="' + junctionRadius
+            + '" fill="' + color + '"/>';
+    }
+
+    for (const arrow of emitted.arrows) {
+        svg += renderArrow(arrow.x, arrow.y, arrow.direction, color, arrowSize);
+    }
+
+    svg += '</g>';
+
+    svg += renderSectionNodes(sectionLayout, rowTops, offsetX, nodeHeight, style, color);
+    return svg;
+}
+
+/**
+ * @brief Draws the node boxes of a section.
+ *
+ * @param {Object} sectionLayout - Layout with rows of nodes.
+ * @param {Array} rowTops - Pixel Y of each row's top edge.
+ * @param {number} offsetX - Translation from section-local X to page X.
+ * @param {number} nodeHeight - Shared node height.
+ * @param {Object} style - Style configuration.
+ * @param {string} color - Stroke colour.
+ * @returns {string} SVG markup for the boxes and their text.
+ */
+function renderSectionNodes(sectionLayout, rowTops, offsetX, nodeHeight, style, color) {
     let svg = '';
-    const nodePadding = parsePaddingValues(style['node-padding']);
-    const nodeMinWidth = style['node-min-width'] || 120;
-
-    // Calculate node height based on text content, not section space
-    // Height = top padding + heading line + (hint line if any nodes have hints) + bottom padding
     const fontSize = style['font-size'] || 14;
-    const hintSize = style['hint-size'] || 11;
-    const lineSpacing = 6;  // Space between heading and hint
 
-    // Check if any node in the section has a hint
-    const hasAnyHints = sectionLayout.rows.some(row =>
-        row.nodes.some(node => node.hint)
-    );
+    sectionLayout.rows.forEach((row, rowIndex) => {
+        const top = rowTops[rowIndex];
 
-    // Calculate node height: padding + heading + optional hint
-    const textHeight = hasAnyHints
-        ? fontSize + lineSpacing + hintSize  // heading + spacing + hint
-        : fontSize;                           // heading only
-    const nodeHeight = nodePadding.top + textHeight + nodePadding.bottom;
-
-    // Calculate vertical spacing for grid routing
-    const channelSpacing = 15;  // Must match renderConnectionsInSection
-    const rowSpacing = 20;  // Minimum space between node rows for routing
-
-    // Start at bounds.y (which already accounts for section label in renderLayoutNode)
-    let currentY = bounds.y;
-
-    for (let rowIndex = 0; rowIndex < sectionLayout.rows.length; rowIndex++) {
-        const row = sectionLayout.rows[rowIndex];
-
-        // Render nodes in this row
         for (const node of row.nodes) {
-            const nodeWidth = nodeMinWidth;
-            const nodeX = bounds.x + (node.column * bounds.width) - (nodeWidth / 2);
-            const nodeY = currentY;
+            const width = node.pixelWidth;
+            const left = offsetX + node.localX - width / 2;
 
-            // Draw node box
-            svg += `<rect x="${nodeX}" y="${nodeY}" width="${nodeWidth}" height="${nodeHeight}"
-                rx="${style['node-radius']}" ry="${style['node-radius']}"
-                fill="#ffffff" stroke="${color}" stroke-width="${style['node-border']}"/>`;
+            svg += '<rect x="' + left + '" y="' + top + '" width="' + width
+                + '" height="' + nodeHeight + '"'
+                + ' rx="' + style['node-radius'] + '" ry="' + style['node-radius'] + '"'
+                + ' fill="#ffffff" stroke="' + color + '"'
+                + ' stroke-width="' + style['node-border'] + '"/>';
 
-            // Draw node name (centered)
-            const textX = nodeX + nodeWidth / 2;
-            const nameY = nodeY + (node.hint ? nodeHeight / 2 - 5 : nodeHeight / 2 + 5);
+            const textX = offsetX + node.localX;
+            const nameY = top + (node.hint ? nodeHeight / 2 - 5 : nodeHeight / 2 + fontSize / 2 - 1);
             const displayName = style.uppercase ? node.name.toUpperCase() : node.name;
 
-            svg += `<text x="${textX}" y="${nameY}" class="node-text">${displayName}</text>`;
+            svg += '<text x="' + textX + '" y="' + nameY + '" class="node-text">'
+                + displayName + '</text>';
 
-            // Draw hint if present
             if (node.hint) {
-                const hintY = nodeY + nodeHeight / 2 + 12;
-                svg += `<text x="${textX}" y="${hintY}" class="hint-text">${node.hint}</text>`;
-            }
-
-            // Store pixel position on node for connection routing
-            node.pixelX = nodeX + nodeWidth / 2;
-            node.pixelY = nodeY;
-            node.pixelWidth = nodeWidth;
-            node.pixelHeight = nodeHeight;
-        }
-
-        // Add spacing only BETWEEN rows (not after the last row)
-        const isLastRow = rowIndex === sectionLayout.rows.length - 1;
-        if (!isLastRow) {
-            // Add grid spacing for next row based on routing channels needed
-            if (rowIndex < sectionLayout.gridHeights.length) {
-                // Grid height is in units (channels needed), multiply by channel spacing
-                const gridSpace = sectionLayout.gridHeights[rowIndex] * channelSpacing;
-                currentY += nodeHeight + Math.max(rowSpacing, gridSpace);
-            } else {
-                currentY += nodeHeight + rowSpacing;
+                svg += '<text x="' + textX + '" y="' + (top + nodeHeight / 2 + 12)
+                    + '" class="hint-text">' + node.hint + '</text>';
             }
         }
-    }
+    });
 
     return svg;
 }
 
-/**
- * @brief Converts an exit position (0-1 range) to pixel X coordinate.
- *
- * Exit positions are the vertical corridors between nodes where wires
- * can travel without intersecting nodes.
- *
- * @param {number} exitPos - Exit position as fraction (0 to 1).
- * @param {Object} bounds - Section bounds { x, width }.
- * @returns {number} Pixel X coordinate within section.
- */
-function exitPositionToPixelX(exitPos, bounds) {
-    return bounds.x + (exitPos * bounds.width);
-}
-
-/**
- * @brief Selects the exit position for routing through an intermediate row.
- *
- * Chooses an exit position BETWEEN the source and target columns to minimize
- * the total wire path length. The exit position should be:
- * - Within the range [min(source, target), max(source, target)]
- * - As close to the target as possible (to minimize final horizontal segment)
- *
- * If no exit positions are in range, picks the closest one to the target.
- *
- * @param {Object} source - Source node with column property.
- * @param {Object} target - Target node with column property.
- * @param {Object} rowData - Row data with exitPositions array.
- * @returns {number} Selected exit position (0 to 1).
- */
-function selectExitPositionForRow(source, target, rowData) {
-    const exitPositions = rowData.exitPositions || [];
-    if (exitPositions.length === 0) return target.column;
-
-    const sourceCol = source.column;
-    const targetCol = target.column;
-    const minCol = Math.min(sourceCol, targetCol);
-    const maxCol = Math.max(sourceCol, targetCol);
-
-    // Find exit positions between source and target
-    const validExits = exitPositions.filter(e => e >= minCol && e <= maxCol);
-
-    if (validExits.length > 0) {
-        // Pick the one closest to target
-        return validExits.reduce((closest, e) =>
-            Math.abs(e - targetCol) < Math.abs(closest - targetCol) ? e : closest
-        );
-    }
-
-    // No exits in range - pick the closest to target overall
-    return exitPositions.reduce((closest, e) =>
-        Math.abs(e - targetCol) < Math.abs(closest - targetCol) ? e : closest
-    );
-}
-
-/**
- * @brief Checks if a column position falls in a clear corridor (between nodes).
- *
- * A clear corridor exists between adjacent nodes, before the first node,
- * or after the last node. If the target column is in a clear corridor,
- * the wire can route directly to that column without detouring to an
- * exit position.
- *
- * @param {number} col - The column position to check (0 to 1).
- * @param {Object} rowData - Row data with nodes array.
- * @param {number} margin - Minimum distance from node edges (default 0.02).
- * @returns {boolean} True if column is in a clear corridor, false if blocked.
- */
-function isColumnInClearCorridor(col, rowData, margin = 0.02) {
-    const nodes = rowData.nodes || [];
-    if (nodes.length === 0) return true;  // No nodes = entire row is clear
-
-    // Get sorted node columns
-    const nodeColumns = nodes.map(n => n.column).sort((a, b) => a - b);
-
-    // Check if column is before first node (with margin)
-    if (col < nodeColumns[0] - margin) return true;
-
-    // Check if column is after last node (with margin)
-    if (col > nodeColumns[nodeColumns.length - 1] + margin) return true;
-
-    // Check if column is between any two adjacent nodes
-    for (let i = 0; i < nodeColumns.length - 1; i++) {
-        const leftNode = nodeColumns[i];
-        const rightNode = nodeColumns[i + 1];
-        // Column must be sufficiently away from both node edges
-        if (col > leftNode + margin && col < rightNode - margin) {
-            return true;
-        }
-    }
-
-    return false;  // Column is on top of or too close to a node
-}
-
-/**
- * @brief Selects optimal X position for vertical routing through an intermediate row.
- *
- * Prioritizes keeping the wire straight (vertical) as long as possible:
- * 1. If SOURCE column is in a clear corridor → use it (wire goes straight, turns later)
- * 2. Else if TARGET column is in a clear corridor → use it (wire turns early)
- * 3. Else → use nearest exit position
- *
- * This creates more direct-looking wire paths by minimizing early horizontal movement.
- *
- * @param {Object} source - Source node with column property.
- * @param {Object} target - Target node with column property.
- * @param {Object} rowData - Row data with nodes array and exitPositions.
- * @returns {number} Optimal column position for vertical routing (0 to 1).
- */
-function selectOptimalRoutingColumn(source, target, rowData) {
-    // Priority 1: If source column is clear, wire can go straight through
-    // This minimizes early horizontal movement for a more direct path
-    if (isColumnInClearCorridor(source.column, rowData)) {
-        return source.column;
-    }
-
-    // Priority 2: If target column is clear, turn early to target lane
-    if (isColumnInClearCorridor(target.column, rowData)) {
-        return target.column;
-    }
-
-    // Priority 3: Use nearest exit position between source and target
-    return selectExitPositionForRow(source, target, rowData);
-}
-
-/**
- * @brief Renders connections within a section as SVG paths.
- *
- * Renders orthogonal wire paths with the following structure:
- * - Straight lines: Direct vertical connection (no corners)
- * - Routed lines (down): Down → Horizontal → Down (two corners)
- * - Routed lines (up): Up → Horizontal → Up (two corners)
- *
- * Channel spacing ensures wires don't overlap:
- * - Channels are assigned PER-GAP (each gap has its own 1, 2, 3, ... numbering)
- * - Higher channel numbers are closer to source (turn first)
- * - Lower channel numbers are closer to destination (turn later)
- * - Channel Y position: sourceY + (gapChannel * channelSpacing) for down
- * - Channel Y position: sourceY - (gapChannel * channelSpacing) for up
- *
- * Port offsets ensure multiple connections from same node don't overlap:
- * - sourcePortOffset: Horizontal offset from node center for outgoing port
- * - targetPortOffset: Horizontal offset from node center for incoming port
- *
- * Wire merging rules:
- * - Outgoing: Each connection from a source gets its own separate wire.
- *   Wires split naturally without junction dots for a clean appearance.
- * - Incoming: Multiple wires to the same target share a horizontal channel.
- *   Each wire drops vertically to the channel, with junction dots at each
- *   source's X position. One wire drops from the channel to the target with
- *   a single arrow entering the node.
- *
- * Arrow placement:
- * - Arrows are rendered OUTSIDE nodes, pointing IN (tip at node edge, body outside)
- * - For downward connections: arrow points DOWN into the top of the target node
- * - For upward connections: arrow points UP into the bottom of the target node
- * - Bidirectional connections have arrows at both ends
- *
- * Junction dots (circles) are only placed at incoming merge points where
- * multiple wires converge before entering a single target node.
- *
- * @pre routes must be from buildConnectionRoutes with valid from/to nodes
- * @pre Each route.from and route.to must have pixelX, pixelY, pixelHeight set
- * @pre style must contain line-thickness
- *
- * @param {Array} routes - Connection routes from buildConnectionRoutes.
- * @param {Object} style - Style configuration with line-thickness.
- * @param {string} color - Connection color for paths, arrows, and junctions.
- * @param {Object} sectionLayout - Section layout with rows and exit positions (optional).
- * @param {Object} bounds - Section bounds { x, y, width, height } (optional).
- * @returns {string} SVG markup for paths, arrows, and junction dots.
- */
-function renderConnectionsInSection(routes, style, color, sectionLayout = null, bounds = null) {
-    let svg = '';
-    const lineThickness = style['line-thickness'] || 2;
-    const arrowSize = 8;
-    const channelSpacing = 15;  // Pixels between horizontal routing channels
-    const junctionRadius = 4;   // Radius of junction dots
-    const mergeOffset = arrowSize + 6;  // Distance above target for merge junction
-
-    // Separate routes by direction for proper merge handling
-    const downwardRoutes = routes.filter(r => r.direction !== 'up');
-    const upwardRoutes = routes.filter(r => r.direction === 'up');
-
-    // Group DOWNWARD routes by target for incoming wire merging
-    const routesByTargetDown = {};
-    for (let i = 0; i < downwardRoutes.length; i++) {
-        const route = downwardRoutes[i];
-        const targetId = route.to.id;
-        if (!routesByTargetDown[targetId]) {
-            routesByTargetDown[targetId] = [];
-        }
-        routesByTargetDown[targetId].push({ route, index: i });
-    }
-
-    // Track which targets have multiple incoming downward wires
-    const mergeTargetsDown = new Set();
-    for (const targetId in routesByTargetDown) {
-        if (routesByTargetDown[targetId].length > 1) {
-            mergeTargetsDown.add(targetId);
-        }
-    }
-
-    // Group UPWARD routes by target for incoming wire merging
-    const routesByTargetUp = {};
-    for (let i = 0; i < upwardRoutes.length; i++) {
-        const route = upwardRoutes[i];
-        const targetId = route.to.id;
-        if (!routesByTargetUp[targetId]) {
-            routesByTargetUp[targetId] = [];
-        }
-        routesByTargetUp[targetId].push({ route, index: i });
-    }
-
-    // Track which targets have multiple incoming upward wires
-    const mergeTargetsUp = new Set();
-    for (const targetId in routesByTargetUp) {
-        if (routesByTargetUp[targetId].length > 1) {
-            mergeTargetsUp.add(targetId);
-        }
-    }
-
-    // =========================================================================
-    // Render DOWNWARD connections with smart routing to avoid nodes
-    // =========================================================================
-    const mergeDataDown = {};  // targetId -> { channelY, sourceXPositions[], targetX }
-
-    // Collect all node bounds for obstacle detection
-    const allNodeBounds = routes.map(r => ({
-        minX: r.from.pixelX - r.from.pixelWidth / 2,
-        maxX: r.from.pixelX + r.from.pixelWidth / 2,
-        minY: r.from.pixelY,
-        maxY: r.from.pixelY + r.from.pixelHeight,
-        row: r.from.row
-    })).concat(routes.map(r => ({
-        minX: r.to.pixelX - r.to.pixelWidth / 2,
-        maxX: r.to.pixelX + r.to.pixelWidth / 2,
-        minY: r.to.pixelY,
-        maxY: r.to.pixelY + r.to.pixelHeight,
-        row: r.to.row
-    })));
-
-    // Helper: Get the gap channel for a route's first gap
-    // For downward routes: gap is sourceRow to sourceRow+1
-    // For upward routes: gap is (sourceRow-1) to sourceRow
-    function getGapChannel(route, direction) {
-        if (route.isStraight || !route.gapChannels) return 0;
-
-        let gapKey;
-        if (direction === 'down') {
-            // Downward: first gap is from source row to source row + 1
-            gapKey = `${route.from.row}-${route.from.row + 1}`;
-        } else {
-            // Upward: first gap is from (source row - 1) to source row
-            gapKey = `${route.from.row - 1}-${route.from.row}`;
-        }
-
-        return route.gapChannels[gapKey] || 1;
-    }
-
-    // =========================================================================
-    // Lane Assignment Pre-pass
-    // When multiple routes pass through the same exit position (vertical corridor),
-    // assign horizontal lane offsets to prevent overlapping wires.
-    // =========================================================================
-    const laneSpacing = 8;  // Pixels between lanes at shared exit positions
-    const routeLaneOffsets = new Map();  // route -> lane offset in pixels
-
-    if (sectionLayout && bounds) {
-        // Calculate exit positions for all multi-row routes
-        const exitPositionGroups = {};  // "exitPos-rowNum" -> [routes]
-
-        for (const route of routes) {
-            const source = route.from;
-            const target = route.to;
-            const isDownward = route.direction !== 'up';
-            const rowSpan = isDownward ? (target.row - source.row) : (source.row - target.row);
-
-            // Only multi-row routes need exit position routing
-            if (rowSpan <= 1) continue;
-            if (route.isStraight && Math.abs(source.column - target.column) < 0.01) continue;
-
-            // Find the adjacent row (intermediate row)
-            const adjacentRowNum = isDownward ? (source.row + 1) : (source.row - 1);
-            const adjacentRow = sectionLayout.rows.find(r => r.rowNum === adjacentRowNum);
-
-            if (!adjacentRow) continue;
-
-            // Calculate the exit position this route will use
-            const exitPos = selectOptimalRoutingColumn(source, target, adjacentRow);
-
-            // Group by exit position and row (rounded to avoid float precision issues)
-            const groupKey = `${Math.round(exitPos * 1000)}-${adjacentRowNum}`;
-
-            if (!exitPositionGroups[groupKey]) {
-                exitPositionGroups[groupKey] = [];
-            }
-            exitPositionGroups[groupKey].push(route);
-        }
-
-        // Assign lane offsets to routes sharing the same exit position
-        for (const groupKey in exitPositionGroups) {
-            const groupRoutes = exitPositionGroups[groupKey];
-            if (groupRoutes.length <= 1) continue;  // No conflict
-
-            // Sort routes by target column for consistent ordering
-            groupRoutes.sort((a, b) => a.to.column - b.to.column);
-
-            // Center the lanes around the exit position
-            const numRoutes = groupRoutes.length;
-            const totalWidth = (numRoutes - 1) * laneSpacing;
-            const startOffset = -totalWidth / 2;
-
-            groupRoutes.forEach((route, idx) => {
-                routeLaneOffsets.set(route, startOffset + idx * laneSpacing);
-            });
-        }
-    }
-
-    for (const route of downwardRoutes) {
-        const source = route.from;
-        const target = route.to;
-
-        if (!source.pixelX || !target.pixelX) continue;
-
-        const sourcePortOffset = route.sourcePortOffset || 0;
-        const sourceX = source.pixelX + sourcePortOffset;
-        const sourceY = source.pixelY + source.pixelHeight;  // Bottom of source
-        const targetX = target.pixelX;
-
-        const hasMergeJunction = mergeTargetsDown.has(target.id);
-        const dashArray = route.dashed ? '5,5' : 'none';
-
-        // Check if this connection spans multiple rows (skips intermediate rows)
-        const rowSpan = target.row - source.row;
-        const needsSmartRouting = rowSpan > 1;
-
-        if (hasMergeJunction) {
-            const gapChannel = getGapChannel(route, 'down');
-            const channelY = sourceY + (gapChannel * channelSpacing);
-
-            if (!mergeDataDown[target.id]) {
-                mergeDataDown[target.id] = {
-                    channelY: channelY,
-                    sourceXPositions: [],
-                    targetX: targetX,
-                    target: target
-                };
-            }
-
-            mergeDataDown[target.id].sourceXPositions.push(sourceX);
-
-            svg += `<path d="M ${sourceX} ${sourceY} L ${sourceX} ${channelY}"
-                fill="none" stroke="${color}" stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-
-        } else {
-            const targetPortOffset = route.targetPortOffset || 0;
-            const finalTargetX = target.pixelX + targetPortOffset;
-            const targetY = target.pixelY;  // Top of target
-
-            let pathD;
-
-            if (route.isStraight) {
-                // For straight lines spanning multiple rows, use exit positions
-                if (needsSmartRouting && sectionLayout && bounds) {
-                    // Use exit positions for principled routing through intermediate rows
-                    // Find the adjacent row to get exit position
-                    const adjacentRowNum = source.row + 1;
-                    const adjacentRow = sectionLayout.rows.find(r => r.rowNum === adjacentRowNum);
-
-                    if (adjacentRow) {
-                        // Select optimal routing column (target column if clear, else exit position)
-                        const exitPos = selectOptimalRoutingColumn(source, target, adjacentRow);
-                        const laneOffset = routeLaneOffsets.get(route) || 0;
-                        const exitX = exitPositionToPixelX(exitPos, bounds) + laneOffset;
-
-                        // Route: source -> down to channel -> horizontal to exit -> down to target area -> horizontal to target -> down
-                        const channelY1 = sourceY + channelSpacing;
-                        const channelY2 = targetY - channelSpacing;
-
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${channelY1}`;
-                        pathD += ` L ${exitX} ${channelY1}`;
-                        pathD += ` L ${exitX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    } else {
-                        // Fallback: simple vertical/horizontal path
-                        const midY = (sourceY + targetY) / 2;
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${midY}`;
-                        pathD += ` L ${finalTargetX} ${midY}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    }
-                } else if (needsSmartRouting) {
-                    // Legacy obstacle-based routing (fallback when layout not available)
-                    const minRouteX = Math.min(sourceX, finalTargetX) - 5;
-                    const maxRouteX = Math.max(sourceX, finalTargetX) + 5;
-
-                    const obstacles = allNodeBounds.filter(nb =>
-                        nb.row > source.row && nb.row < target.row &&
-                        nb.minX < maxRouteX && nb.maxX > minRouteX
-                    );
-
-                    if (obstacles.length > 0) {
-                        const obstacleMaxX = Math.max(...obstacles.map(o => o.maxX));
-                        const obstacleMinX = Math.min(...obstacles.map(o => o.minX));
-                        const goRight = sourceX >= (obstacleMinX + obstacleMaxX) / 2;
-                        const safeX = goRight
-                            ? obstacleMaxX + channelSpacing
-                            : obstacleMinX - channelSpacing;
-
-                        const channelY1 = sourceY + channelSpacing;
-                        const channelY2 = targetY - channelSpacing;
-
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${channelY1}`;
-                        pathD += ` L ${safeX} ${channelY1}`;
-                        pathD += ` L ${safeX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    } else {
-                        if (Math.abs(sourceX - finalTargetX) < 1) {
-                            pathD = `M ${sourceX} ${sourceY} L ${finalTargetX} ${targetY}`;
-                        } else {
-                            const midY = (sourceY + targetY) / 2;
-                            pathD = `M ${sourceX} ${sourceY}`;
-                            pathD += ` L ${sourceX} ${midY}`;
-                            pathD += ` L ${finalTargetX} ${midY}`;
-                            pathD += ` L ${finalTargetX} ${targetY}`;
-                        }
-                    }
-                } else {
-                    if (Math.abs(sourceX - finalTargetX) < 1) {
-                        pathD = `M ${sourceX} ${sourceY} L ${finalTargetX} ${targetY}`;
-                    } else {
-                        const midY = (sourceY + targetY) / 2;
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${midY}`;
-                        pathD += ` L ${finalTargetX} ${midY}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    }
-                }
-            } else {
-                // Non-aligned connection with routing channel
-                const gapChannel = getGapChannel(route, 'down');
-                if (needsSmartRouting && sectionLayout && bounds) {
-                    // Use exit positions for principled routing
-                    const channelY = sourceY + (gapChannel * channelSpacing);
-                    const adjacentRowNum = source.row + 1;
-                    const adjacentRow = sectionLayout.rows.find(r => r.rowNum === adjacentRowNum);
-
-                    if (adjacentRow) {
-                        // Select optimal routing column (target column if clear, else exit position)
-                        const exitPos = selectOptimalRoutingColumn(source, target, adjacentRow);
-                        const laneOffset = routeLaneOffsets.get(route) || 0;
-                        const exitX = exitPositionToPixelX(exitPos, bounds) + laneOffset;
-                        const channelY2 = targetY - channelSpacing;
-
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${channelY}`;
-                        pathD += ` L ${exitX} ${channelY}`;
-                        pathD += ` L ${exitX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    } else {
-                        // Fallback if row not found
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${channelY}`;
-                        pathD += ` L ${finalTargetX} ${channelY}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    }
-                } else if (needsSmartRouting) {
-                    // Legacy obstacle-based routing
-                    const channelY = sourceY + (gapChannel * channelSpacing);
-                    const minRouteX = Math.min(sourceX, finalTargetX) - 5;
-                    const maxRouteX = Math.max(sourceX, finalTargetX) + 5;
-
-                    const obstacles = allNodeBounds.filter(nb =>
-                        nb.row > source.row && nb.row < target.row &&
-                        nb.minY < channelY && nb.maxY > channelY &&
-                        nb.minX < maxRouteX && nb.maxX > minRouteX
-                    );
-
-                    if (obstacles.length > 0) {
-                        const obstacleMaxX = Math.max(...obstacles.map(o => o.maxX));
-                        const obstacleMinX = Math.min(...obstacles.map(o => o.minX));
-                        const goRight = sourceX >= (obstacleMinX + obstacleMaxX) / 2;
-                        const safeX = goRight
-                            ? obstacleMaxX + channelSpacing
-                            : obstacleMinX - channelSpacing;
-                        const channelY2 = targetY - channelSpacing;
-
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${channelY}`;
-                        pathD += ` L ${safeX} ${channelY}`;
-                        pathD += ` L ${safeX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${channelY2}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    } else {
-                        pathD = `M ${sourceX} ${sourceY}`;
-                        pathD += ` L ${sourceX} ${channelY}`;
-                        pathD += ` L ${finalTargetX} ${channelY}`;
-                        pathD += ` L ${finalTargetX} ${targetY}`;
-                    }
-                } else {
-                    const channelY = sourceY + (gapChannel * channelSpacing);
-                    pathD = `M ${sourceX} ${sourceY}`;
-                    pathD += ` L ${sourceX} ${channelY}`;
-                    pathD += ` L ${finalTargetX} ${channelY}`;
-                    pathD += ` L ${finalTargetX} ${targetY}`;
-                }
-            }
-
-            svg += `<path d="${pathD}" fill="none" stroke="${color}"
-                stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-
-            // Arrow pointing down into top of target
-            svg += renderArrow(finalTargetX, targetY, 'down', color, arrowSize);
-        }
-
-        // Bidirectional: arrow at source pointing up into bottom
-        if (route.type === 'bidirectional') {
-            svg += renderArrow(sourceX, sourceY, 'up', color, arrowSize);
-        }
-    }
-
-    // Render merge junctions for downward connections
-    // Junction dot rule: n-1 dots for n wires merging, exclude the drop point
-    for (const targetId in mergeDataDown) {
-        const data = mergeDataDown[targetId];
-        const { channelY, sourceXPositions, targetX, target } = data;
-
-        const allXPositions = [...sourceXPositions, targetX];
-        const minX = Math.min(...allXPositions);
-        const maxX = Math.max(...allXPositions);
-
-        // Draw the horizontal merge channel
-        svg += `<path d="M ${minX} ${channelY} L ${maxX} ${channelY}"
-            fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-
-        // Place junction dots at n-1 positions (exclude the drop point at targetX)
-        // Sort positions to find which ones need dots
-        const sortedPositions = [...sourceXPositions].sort((a, b) => a - b);
-        const junctionTolerance = 2;  // Pixels tolerance for "same position"
-
-        for (const srcX of sortedPositions) {
-            // Only place dot if this position is NOT the drop point (targetX)
-            if (Math.abs(srcX - targetX) > junctionTolerance) {
-                svg += `<circle cx="${srcX}" cy="${channelY}" r="${junctionRadius}" fill="${color}"/>`;
-            }
-        }
-
-        // Draw vertical drop from channel to target
-        svg += `<path d="M ${targetX} ${channelY} L ${targetX} ${target.pixelY}"
-            fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-
-        svg += renderArrow(targetX, target.pixelY, 'down', color, arrowSize);
-    }
-
-    // =========================================================================
-    // Render UPWARD connections with INTERIOR GRID ROUTING
-    //
-    // Strategy: Route upward connections through the interior grid, similar to
-    // downward connections but in reverse direction. This keeps all wires within
-    // the section bounds and uses the same channel system.
-    //
-    // Path: source TOP → up to channel → horizontal → channel near target → target BOTTOM
-    // =========================================================================
-    const mergeDataUp = {};  // targetId -> { channelY, sourceXPositions[], targetX, targetY }
-
-    for (const route of upwardRoutes) {
-        const source = route.from;
-        const target = route.to;
-
-        if (!source.pixelX || !target.pixelX) continue;
-
-        const sourcePortOffset = route.sourcePortOffset || 0;
-        const sourceX = source.pixelX + sourcePortOffset;
-        const sourceY = source.pixelY;  // Top of source (going up)
-
-        const hasMergeJunction = mergeTargetsUp.has(target.id);
-        const dashArray = route.dashed ? '5,5' : 'none';
-
-        // Calculate target Y (bottom of target node for upward entry)
-        const finalTargetY = target.pixelY + target.pixelHeight;
-
-        // Grid channel Y should use SAME reference as downward connections
-        // For Gap X-Y, both directions use: bottom_of_row_X + channel * channelSpacing
-        // This ensures upward channel 2 and downward channel 2 are at SAME Y position
-        const gapChannel = getGapChannel(route, 'up');
-
-        // Find the row above source to get its bottom Y (the gap's top edge)
-        const adjacentRowNum = source.row - 1;
-        const adjacentRow = sectionLayout ? sectionLayout.rows.find(r => r.rowNum === adjacentRowNum) : null;
-        let gapTopY = sourceY - channelSpacing;  // Fallback: estimate based on source
-        if (adjacentRow && adjacentRow.nodes.length > 0) {
-            // Use the bottom of the row above as the gap's top edge
-            gapTopY = Math.max(...adjacentRow.nodes.map(n => n.pixelY + n.pixelHeight));
-        }
-        const channelY = gapTopY + (gapChannel * channelSpacing);
-
-        // Channel Y just below target (for final approach)
-        const targetChannelY = finalTargetY + channelSpacing;
-
-        if (hasMergeJunction) {
-            const targetPortOffset = route.targetPortOffset || 0;
-            const finalTargetX = target.pixelX + targetPortOffset;
-
-            // Calculate exit position for vertical routing (only for multi-row)
-            let exitX = finalTargetX;
-            const rowDistance = source.row - target.row;
-            if (rowDistance > 1 && sectionLayout && bounds) {
-                const adjacentRowNum = source.row - 1;
-                const adjacentRow = sectionLayout.rows.find(r => r.rowNum === adjacentRowNum);
-                if (adjacentRow && adjacentRowNum > target.row) {
-                    const exitPos = selectOptimalRoutingColumn(source, target, adjacentRow);
-                    const laneOffset = routeLaneOffsets.get(route) || 0;
-                    exitX = exitPositionToPixelX(exitPos, bounds) + laneOffset;
-                }
-            }
-
-            if (!mergeDataUp[target.id]) {
-                mergeDataUp[target.id] = {
-                    exitX: exitX,
-                    sourceXPositions: [],
-                    sourceChannelYs: [],
-                    targetX: finalTargetX,
-                    target: target,
-                    targetY: finalTargetY,
-                    targetChannelY: targetChannelY
-                };
-            }
-
-            mergeDataUp[target.id].sourceXPositions.push(sourceX);
-            mergeDataUp[target.id].sourceChannelYs.push(channelY);
-
-            // Draw: source → up to channel → horizontal toward exit position
-            svg += `<path d="M ${sourceX} ${sourceY} L ${sourceX} ${channelY} L ${exitX} ${channelY}"
-                fill="none" stroke="${color}" stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-
-        } else {
-            const targetPortOffset = route.targetPortOffset || 0;
-            const finalTargetX = target.pixelX + targetPortOffset;
-
-            // Check if source and target are vertically aligned
-            if (Math.abs(sourceX - finalTargetX) < 1) {
-                // Straight vertical line
-                const pathD = `M ${sourceX} ${sourceY} L ${finalTargetX} ${finalTargetY}`;
-                svg += `<path d="${pathD}" fill="none" stroke="${color}"
-                    stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-            } else {
-                // Interior grid routing: source → channel → exit position → target channel → target
-                let pathD = `M ${sourceX} ${sourceY}`;
-                pathD += ` L ${sourceX} ${channelY}`;  // Up to source channel
-
-                // Check if there's an intermediate row between source and target
-                // For adjacent rows (source.row - target.row == 1), route directly
-                const rowDistance = source.row - target.row;
-
-                if (rowDistance > 1 && sectionLayout && bounds) {
-                    // Multi-row: use optimal routing column (direct if clear, else exit position)
-                    const adjacentRowNum = source.row - 1;
-                    const adjacentRow = sectionLayout.rows.find(r => r.rowNum === adjacentRowNum);
-                    if (adjacentRow && adjacentRowNum > target.row) {
-                        const exitPos = selectOptimalRoutingColumn(source, target, adjacentRow);
-                        const laneOffset = routeLaneOffsets.get(route) || 0;
-                        const exitX = exitPositionToPixelX(exitPos, bounds) + laneOffset;
-                        pathD += ` L ${exitX} ${channelY}`;        // Horizontal to exit position
-                        pathD += ` L ${exitX} ${targetChannelY}`;  // Vertical up through grid
-                        pathD += ` L ${finalTargetX} ${targetChannelY}`;  // Horizontal to target
-                        pathD += ` L ${finalTargetX} ${finalTargetY}`;    // Up to target
-                    } else {
-                        // Fallback: direct routing
-                        pathD += ` L ${finalTargetX} ${channelY}`;
-                        pathD += ` L ${finalTargetX} ${finalTargetY}`;
-                    }
-                } else {
-                    // Adjacent rows or no layout: simple L-shape routing
-                    pathD += ` L ${finalTargetX} ${channelY}`;
-                    pathD += ` L ${finalTargetX} ${finalTargetY}`;
-                }
-
-                svg += `<path d="${pathD}" fill="none" stroke="${color}"
-                    stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-            }
-
-            // Arrow pointing UP into bottom of target
-            svg += renderArrow(finalTargetX, finalTargetY, 'up', color, arrowSize);
-        }
-
-        // Bidirectional: arrow at source pointing down into top
-        if (route.type === 'bidirectional') {
-            svg += renderArrow(sourceX, sourceY, 'down', color, arrowSize);
-        }
-    }
-
-    // Render merge junctions for upward connections (interior grid routing)
-    // Junction dot rule: n-1 dots for n wires merging
-    for (const targetId in mergeDataUp) {
-        const data = mergeDataUp[targetId];
-        const { exitX, sourceXPositions, sourceChannelYs, targetX, target, targetY, targetChannelY } = data;
-
-        // The merge point is at the exit position (or target X if no exit position)
-        const mergeX = exitX || targetX;
-
-        // Find the min and max channel Y for vertical routing
-        const minChannelY = Math.min(...sourceChannelYs);
-
-        // Vertical segment connecting all source channels to target channel
-        if (sourceChannelYs.length > 0) {
-            svg += `<path d="M ${mergeX} ${minChannelY} L ${mergeX} ${targetChannelY}"
-                fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-        }
-
-        // Place n-1 junction dots on the vertical bus
-        // Sort channel Y positions and exclude the one closest to targetChannelY (the "drop point")
-        const sortedChannelYs = [...sourceChannelYs].sort((a, b) => a - b);
-        const junctionTolerance = 2;  // Pixels tolerance
-
-        // Find which source channel Y is closest to targetChannelY (this is the drop point)
-        let dropPointY = null;
-        let minDist = Infinity;
-        for (const srcChannelY of sortedChannelYs) {
-            const dist = Math.abs(srcChannelY - targetChannelY);
-            if (dist < minDist) {
-                minDist = dist;
-                dropPointY = srcChannelY;
-            }
-        }
-
-        // Place dots at all positions except the drop point
-        for (const srcChannelY of sortedChannelYs) {
-            if (dropPointY === null || Math.abs(srcChannelY - dropPointY) > junctionTolerance) {
-                svg += `<circle cx="${mergeX}" cy="${srcChannelY}" r="${junctionRadius}" fill="${color}"/>`;
-            }
-        }
-
-        // Horizontal from merge point to target (if not aligned)
-        if (Math.abs(mergeX - targetX) > 1) {
-            svg += `<path d="M ${mergeX} ${targetChannelY} L ${targetX} ${targetChannelY}"
-                fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-        }
-
-        // Final vertical to target bottom
-        svg += `<path d="M ${targetX} ${targetChannelY} L ${targetX} ${targetY}"
-            fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-
-        // Arrow pointing up into bottom of target
-        svg += renderArrow(targetX, targetY, 'up', color, arrowSize);
-    }
-
-    return svg;
-}
 
 /**
  * Renders an arrowhead.
@@ -2518,10 +1999,89 @@ function parsePaddingValues(paddingStr) {
 // =============================================================================
 
 /**
- * Renders the diagram to SVG.
+ * @brief Plans the whole diagram, before anything is drawn.
  *
- * The diagram is sized to fit its content, not a fixed page size.
- * This produces compact diagrams suitable for documents and articles.
+ * The passes run in the one order that has no circular dependency. Nets are
+ * decomposed first because that needs no geometry, then every leaf section is
+ * planned, then the page is sized from those plans, then every box is placed.
+ * Emission comes afterwards, because a boundary port sits on a box edge and
+ * its X is an input to the plans on both sides of it.
+ *
+ * @param {Object} style - Style configuration.
+ * @param {Object} layout - Parsed layout tree, may be null.
+ * @param {Object} nodesData - Parsed nodes and connections.
+ * @returns {Object} { margin, contentSize, levels, placement, themeColors }.
+ */
+function planDiagram(style, layout, nodesData) {
+    console.assert(style && nodesData, 'planDiagram needs a style and parsed nodes');
+
+    resetSectionPlans();
+    if (typeof window !== 'undefined' && window.ORCA_VERIFY) window.OrcaCheck = { sections: [] };
+
+    const margin = parsePadding(style['page-margin']);
+    const themeColors = Themes[style.theme] || Themes.default;
+
+    // Pass 1. Split every net that crosses a box edge into per-level pieces.
+    // The gutter planner reads these, and sizing reads the gutter plans, so
+    // this has to be in place before anything is measured.
+    const levels = planLevels(layout, nodesData);
+    ActiveLevels = levels;
+
+    // Passes 2 to 5 repeat until the boxes agree. Sizing is bottom-up and a
+    // boundary port's X is decided top-down, so each round sizes with the
+    // port Xs the previous round's join fixed. The first round uses ports
+    // spread along each edge, which is usually close enough to fit at once.
+    BoundaryHints = {};
+    let contentSize = { width: 400, height: 300 };
+    let placement = null;
+    let fitted = true;
+
+    for (let pass = 0; pass < MAX_JOIN_PASSES; pass++) {
+        if (pass > 0) resetSectionPlans();
+
+        // Pass 2. Plan every leaf section. The densest row gap in the diagram
+        // sets the pitch for all of them, which is what lines the rows up.
+        ActiveGapHeight = layout ? calculateUniformGapHeight(layout, nodesData, style) : 0;
+
+        // Pass 3. Size the page from those plans rather than from a paper size.
+        if (layout) contentSize = calculateNodeContentSize(layout, nodesData, style);
+
+        // Pass 4. Place every box, which fixes where each boundary port sits.
+        placement = placeLayout(layout, { x: margin.left, y: margin.top },
+            contentSize, style, themeColors, nodesData);
+        if (!placement) break;
+
+        // Pass 5. Walk down from the root and route every level to the port
+        // Xs its parent chose, so the pieces of one wire meet. When the result
+        // still fits the room reserved for it, the plan is final.
+        const joined = joinBoundaries(placement);
+        fitted = joined.fits;
+        if (joined.fits) break;
+        BoundaryHints = joined.hints;
+    }
+
+    // The wires still join when the rounds run out, but some level is routed
+    // into less room than it needs, so say so rather than draw it silently.
+    if (placement && !fitted) {
+        if (typeof window !== 'undefined' && window.ORCA_VERIFY) window.OrcaCheck.unfitted = true;
+        levels.errors.push('Some wires between boxes need more room than the layout settled on, '
+            + 'so they may sit close together.');
+    }
+
+    return {
+        margin: margin,
+        contentSize: contentSize,
+        levels: levels,
+        placement: placement,
+        themeColors: themeColors
+    };
+}
+
+/**
+ * @brief Renders the diagram to SVG from its plan.
+ *
+ * The diagram is sized to fit its content, not a fixed page size, which keeps
+ * it compact enough for a document or an article.
  *
  * @param {Object} style - Style configuration.
  * @param {Object} layout - Layout tree.
@@ -2529,23 +2089,15 @@ function parsePaddingValues(paddingStr) {
  * @returns {string} SVG markup string.
  */
 function renderDiagram(style, layout, nodesData) {
-    const margin = parsePadding(style['page-margin']);
+    const plan = planDiagram(style, layout, nodesData);
+    LastDiagramPlan = plan;
 
-    // Calculate content-based dimensions instead of fixed page size
-    let contentSize = { width: 400, height: 300 };  // Default fallback
-    if (layout) {
-        contentSize = calculateNodeContentSize(layout, nodesData, style);
-    }
-
-    // Add margins to content size
-    const width = contentSize.width;
-    const height = contentSize.height;
+    const margin = plan.margin;
+    const themeColors = plan.themeColors;
+    const width = plan.contentSize.width;
+    const height = plan.contentSize.height;
     const totalWidth = width + margin.left + margin.right;
     const totalHeight = height + margin.top + margin.bottom;
-
-    // Get theme colours
-    const themeColors = Themes[style.theme] || Themes.default;
-    let colorIndex = 0;
 
     // Build SVG with content-based dimensions
     let svg = `<svg xmlns="http://www.w3.org/2000/svg"
@@ -2583,12 +2135,10 @@ function renderDiagram(style, layout, nodesData) {
         </style>
     </defs>`;
 
-    // Render layout segments (this assigns pixelX/pixelY to all nodes)
-    if (layout) {
-        svg += renderLayoutNode(layout, margin.left, margin.top, width, height, style, themeColors, colorIndex, nodesData);
-
-        // After all sections are rendered, render cross-section connections
-        svg += renderCrossSectionConnections(nodesData, style, themeColors);
+    // Emit the placed boxes. Every wire, inside a section or across boxes,
+    // is drawn by the level that routes it.
+    if (plan.placement) {
+        svg += emitPlacement(plan.placement, style, themeColors);
     } else {
         // No layout defined - render a placeholder message
         svg += `<text x="${totalWidth/2}" y="${totalHeight/2}"
@@ -2606,330 +2156,6 @@ function renderDiagram(style, layout, nodesData) {
     }
 
     svg += '</svg>';
-
-    return svg;
-}
-
-/**
- * @brief Renders connections between nodes in different sections.
- *
- * Cross-section connections are identified by comparing the section property
- * of source and target nodes. These connections are rendered after all sections
- * have been positioned so that pixel coordinates are available.
- *
- * Routing strategy for cross-section connections:
- * 1. Exit from the source node's bottom (or top for upward)
- * 2. Route horizontally/vertically to avoid overlapping with section boxes
- * 3. Enter the target node's top (or bottom for upward)
- *
- * The routing uses a simple approach:
- * - Vertical exit from source
- * - Horizontal segment at a safe Y position (between sections)
- * - Vertical entry to target
- *
- * @param {Object} nodesData - Parsed nodes data with connections and nodeMap.
- * @param {Object} style - Style configuration.
- * @param {Array} themeColors - Theme color palette.
- * @returns {string} SVG markup for cross-section connection paths.
- */
-function renderCrossSectionConnections(nodesData, style, themeColors) {
-    let svg = '';
-    const lineThickness = style['line-thickness'] || 2;
-    const arrowSize = 8;
-    const channelSpacing = 15;
-    const portSpacing = 12;
-    const junctionRadius = 4;
-
-    // Find cross-section connections
-    const crossSectionConns = [];
-    for (const conn of nodesData.connections) {
-        const source = nodesData.nodeMap[conn.from];
-        const target = nodesData.nodeMap[conn.to];
-
-        if (!source || !target) continue;
-        if (!source.pixelX || !target.pixelX) continue;
-
-        // Check if source and target are in different sections
-        const sourceSection = source.section ? source.section.split(':').pop() : null;
-        const targetSection = target.section ? target.section.split(':').pop() : null;
-
-        if (sourceSection && targetSection && sourceSection !== targetSection) {
-            crossSectionConns.push({
-                source,
-                target,
-                type: conn.type,
-                dashed: conn.dashed,
-                connId: `${conn.from}-${conn.to}`
-            });
-        }
-    }
-
-    if (crossSectionConns.length === 0) return svg;
-
-    // =========================================================================
-    // Channel calculation: group by target (incoming share channel)
-    // =========================================================================
-    const targetGroups = {};
-    for (const conn of crossSectionConns) {
-        const targetId = conn.target.id;
-        if (!targetGroups[targetId]) {
-            targetGroups[targetId] = [];
-        }
-        targetGroups[targetId].push(conn);
-    }
-
-    // Assign channel numbers: one per unique target
-    const channelAssignments = new Map();
-    let channelNum = 1;
-    for (const targetId in targetGroups) {
-        for (const conn of targetGroups[targetId]) {
-            channelAssignments.set(conn.connId, channelNum);
-        }
-        channelNum++;
-    }
-
-    // =========================================================================
-    // Port assignment: calculate source port offsets for nodes with multiple
-    // outgoing cross-section connections, and target port for shared incoming
-    // =========================================================================
-    const sourcePortCounts = {};
-    const targetPortCounts = {};
-
-    for (const conn of crossSectionConns) {
-        const sourceId = conn.source.id;
-        const targetId = conn.target.id;
-
-        if (!sourcePortCounts[sourceId]) sourcePortCounts[sourceId] = [];
-        sourcePortCounts[sourceId].push(conn);
-
-        if (!targetPortCounts[targetId]) targetPortCounts[targetId] = [];
-        targetPortCounts[targetId].push(conn);
-    }
-
-    // Calculate port offsets for sources (each outgoing gets own port)
-    const sourcePortOffsets = new Map();
-    for (const sourceId in sourcePortCounts) {
-        const conns = sourcePortCounts[sourceId];
-        // Sort by target X for left-to-right ordering
-        conns.sort((a, b) => a.target.pixelX - b.target.pixelX);
-        const count = conns.length;
-        conns.forEach((conn, i) => {
-            const offset = count > 1 ? (2 * i - count + 1) * portSpacing / 2 : 0;
-            sourcePortOffsets.set(conn.connId, offset);
-        });
-    }
-
-    // Calculate port offsets for targets (shared by target)
-    const targetPortOffsets = new Map();
-    for (const targetId in targetPortCounts) {
-        const conns = targetPortCounts[targetId];
-        // All incoming to same target share one port (offset 0)
-        conns.forEach(conn => {
-            targetPortOffsets.set(conn.connId, 0);
-        });
-    }
-
-    // =========================================================================
-    // Sort connections for rendering order
-    // =========================================================================
-    crossSectionConns.sort((a, b) => {
-        const aY = Math.min(a.source.pixelY, a.target.pixelY);
-        const bY = Math.min(b.source.pixelY, b.target.pixelY);
-        return aY - bY;
-    });
-
-    // Track merge data for junction dots
-    const mergeData = {};  // targetId -> { channelY, sourceXPositions[], targetX }
-
-    // =========================================================================
-    // Render each cross-section connection
-    // =========================================================================
-    for (const conn of crossSectionConns) {
-        const source = conn.source;
-        const target = conn.target;
-        const channel = channelAssignments.get(conn.connId);
-
-        const goingDown = source.pixelY < target.pixelY;
-
-        const sectionIndex = Object.keys(nodesData.sections).indexOf(source.section);
-        const color = themeColors[sectionIndex % themeColors.length] || themeColors[0];
-        const dashArray = conn.dashed ? '5,5' : 'none';
-
-        const sourcePortOffset = sourcePortOffsets.get(conn.connId) || 0;
-        const sourceX = source.pixelX + sourcePortOffset;
-        const targetX = target.pixelX;
-
-        let sourceY, targetY, channelY;
-
-        if (goingDown) {
-            sourceY = source.pixelY + source.pixelHeight;
-            targetY = target.pixelY;
-            // Channel Y is midpoint plus channel offset
-            channelY = (sourceY + targetY) / 2 + (channel * channelSpacing / 2);
-        } else {
-            sourceY = source.pixelY;
-            targetY = target.pixelY + target.pixelHeight;
-            channelY = (sourceY + targetY) / 2 - (channel * channelSpacing / 2);
-        }
-
-        // Check if this target has multiple incoming
-        const hasMultipleIncoming = (targetPortCounts[target.id] || []).length > 1;
-
-        if (hasMultipleIncoming) {
-            // Render only source to channel, collect for merge rendering
-            svg += `<path d="M ${sourceX} ${sourceY} L ${sourceX} ${channelY}"
-                fill="none" stroke="${color}" stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-
-            if (!mergeData[target.id]) {
-                mergeData[target.id] = {
-                    channelY,
-                    sourceXPositions: [],
-                    targetX,
-                    targetY,
-                    goingDown,
-                    color,
-                    type: conn.type
-                };
-            }
-            mergeData[target.id].sourceXPositions.push(sourceX);
-        } else {
-            // Single connection - render full path
-            let pathD = `M ${sourceX} ${sourceY}`;
-            pathD += ` L ${sourceX} ${channelY}`;
-            pathD += ` L ${targetX} ${channelY}`;
-            pathD += ` L ${targetX} ${targetY}`;
-
-            svg += `<path d="${pathD}" fill="none" stroke="${color}"
-                stroke-width="${lineThickness}" stroke-dasharray="${dashArray}"/>`;
-
-            const arrowDir = goingDown ? 'down' : 'up';
-            svg += renderArrow(targetX, targetY, arrowDir, color, arrowSize);
-        }
-
-        // Bidirectional: arrow at source
-        if (conn.type === 'bidirectional') {
-            const sourceArrowDir = goingDown ? 'up' : 'down';
-            svg += renderArrow(sourceX, sourceY, sourceArrowDir, color, arrowSize);
-        }
-    }
-
-    // =========================================================================
-    // Render merge junctions with proper n-1 dot placement
-    // =========================================================================
-    for (const targetId in mergeData) {
-        const data = mergeData[targetId];
-        const { channelY, sourceXPositions, targetX, targetY, goingDown, color, type } = data;
-
-        const allXPositions = [...sourceXPositions, targetX];
-        const minX = Math.min(...allXPositions);
-        const maxX = Math.max(...allXPositions);
-
-        // Draw horizontal merge channel
-        svg += `<path d="M ${minX} ${channelY} L ${maxX} ${channelY}"
-            fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-
-        // Draw vertical drop to target
-        svg += `<path d="M ${targetX} ${channelY} L ${targetX} ${targetY}"
-            fill="none" stroke="${color}" stroke-width="${lineThickness}"/>`;
-
-        // Junction dots: n-1 dots, exclude drop point (targetX)
-        const junctionTolerance = 2;
-        const sortedPositions = [...sourceXPositions].sort((a, b) => a - b);
-        for (const srcX of sortedPositions) {
-            if (Math.abs(srcX - targetX) > junctionTolerance) {
-                svg += `<circle cx="${srcX}" cy="${channelY}" r="${junctionRadius}" fill="${color}"/>`;
-            }
-        }
-
-        // Arrow at target
-        const arrowDir = goingDown ? 'down' : 'up';
-        svg += renderArrow(targetX, targetY, arrowDir, color, arrowSize);
-    }
-
-    return svg;
-}
-
-/**
- * Recursively renders a layout node (segment or container).
- *
- * @param {Object} node - Layout tree node.
- * @param {number} x - X position.
- * @param {number} y - Y position.
- * @param {number} width - Available width.
- * @param {number} height - Available height.
- * @param {Object} style - Style configuration.
- * @param {Array} themeColors - Theme colour palette.
- * @param {number} colorIndex - Current colour index.
- * @param {Object} nodesData - Parsed nodes and connections data.
- * @param {string} parentName - Parent segment name for qualified lookups.
- * @returns {string} SVG markup.
- */
-function renderLayoutNode(node, x, y, width, height, style, themeColors, colorIndex, nodesData, parentName = null) {
-    let svg = '';
-    const padding = 8;
-    const gap = 10;
-
-    if (node.type === 'segment') {
-        // Get colour for this segment
-        const color = themeColors[colorIndex % themeColors.length];
-
-        // Draw segment box
-        svg += `<rect x="${x}" y="${y}" width="${width}" height="${height}"
-            rx="${style['section-radius']}" ry="${style['section-radius']}"
-            fill="#ffffff" stroke="${color}" stroke-width="${style['section-border']}"/>`;
-
-        // Draw segment label (centered horizontally in the box)
-        if (node.name) {
-            const labelText = style.uppercase ? node.name.toUpperCase() : node.name;
-            const centerX = x + width / 2;
-            svg += `<text x="${centerX}" y="${y + 20}" class="section-label" fill="${color}">
-                ${labelText}
-            </text>`;
-        }
-
-        // Render children if any (nested segments)
-        if (node.children && node.children.length > 0) {
-            const innerX = x + padding;
-            const innerY = y + 30;
-            const innerWidth = width - padding * 2;
-            const innerHeight = height - 30 - padding;
-
-            svg += renderLayoutChildren(node.children, node.direction || 'row',
-                innerX, innerY, innerWidth, innerHeight, style, themeColors, colorIndex + 1, nodesData, node.name);
-        } else if (nodesData) {
-            // Leaf segment - render nodes and connections
-            // Try matching section: first with parent qualifier, then without
-            let sectionKey = parentName ? `${parentName}:${node.name}` : node.name;
-            if (!nodesData.sections[sectionKey] && parentName) {
-                sectionKey = node.name;  // Fallback to unqualified name
-            }
-
-            if (nodesData.sections[sectionKey]) {
-                const bounds = {
-                    x: x + padding,
-                    y: y + 30,
-                    width: width - padding * 2,
-                    height: height - 30 - padding
-                };
-
-                // Calculate layout for this section
-                const sectionLayout = calculateSectionLayout(nodesData, sectionKey);
-
-                if (sectionLayout) {
-                    // Render nodes
-                    svg += renderNodesInSection(sectionLayout, bounds, style, color);
-
-                    // Build and render connections
-                    const routes = buildConnectionRoutes(sectionLayout, nodesData);
-                    svg += renderConnectionsInSection(routes, style, color, sectionLayout, bounds);
-                }
-            }
-        }
-    } else if (node.type === 'container') {
-        // Render children
-        svg += renderLayoutChildren(node.children, node.direction || 'row',
-            x, y, width, height, style, themeColors, colorIndex, nodesData, parentName);
-    }
 
     return svg;
 }
@@ -2959,10 +2185,12 @@ function renderLayoutNode(node, x, y, width, height, style, themeColors, colorIn
  * @returns {Object} { width, height } in pixels.
  */
 function calculateNodeContentSize(node, nodesData, style, parentName = null) {
-    const padding = 8;          // Gap between nested segments
-    const gap = 10;             // Gap between sibling children
-    const labelHeight = 30;     // Section heading height
-    const sectionPadding = 16;  // Bottom padding inside section box
+    // The same three values the placement pass uses. Written once, because a
+    // sizing pass and a placement pass that disagree leave wires outside the
+    // box they belong to.
+    const padding = LAYOUT_PADDING;
+    const labelHeight = SECTION_LABEL_HEIGHT;
+    const sectionPadding = SECTION_BOTTOM_PADDING;
 
     // Calculate node dimensions from style
     const fontSize = style['font-size'] || 14;
@@ -2981,25 +2209,16 @@ function calculateNodeContentSize(node, nodesData, style, parentName = null) {
 
     if (node.type === 'segment') {
         if (node.children && node.children.length > 0) {
-            // Has nested children - calculate based on children
+            // Nested children. The gutter plan owns the size, because a gutter
+            // has to be as wide as the tracks it carries.
             const childSizes = node.children.map(child =>
                 calculateNodeContentSize(child, nodesData, style, node.name)
             );
-
-            const direction = node.direction || 'row';
-            let width, height;
-
-            if (direction === 'row') {
-                width = childSizes.reduce((sum, s) => sum + s.width, 0) + gap * (childSizes.length - 1);
-                height = Math.max(...childSizes.map(s => s.height));
-            } else {
-                width = Math.max(...childSizes.map(s => s.width));
-                height = childSizes.reduce((sum, s) => sum + s.height, 0) + gap * (childSizes.length - 1);
-            }
+            const gutter = getGutterPlan(node, childSizes, style);
 
             return {
-                width: width + padding * 2,
-                height: height + labelHeight + padding
+                width: gutter.contentWidth + padding * 2,
+                height: gutter.contentHeight + labelHeight + padding
             };
         } else {
             // Leaf segment - calculate based on nodes
@@ -3010,35 +2229,11 @@ function calculateNodeContentSize(node, nodesData, style, parentName = null) {
 
             const section = nodesData.sections[sectionKey];
             if (section) {
-                const sectionLayout = calculateSectionLayout(nodesData, sectionKey);
-                if (sectionLayout) {
-                    // Check if any node has a hint
-                    const hasAnyHints = sectionLayout.rows.some(row =>
-                        row.nodes.some(n => n.hint)
-                    );
-                    const nodeHeight = hasAnyHints ? nodeHeightWithHint : nodeHeightNoHint;
-
-                    // Calculate total height: label + rows + grid spacing
-                    let contentHeight = labelHeight;
-                    for (let i = 0; i < sectionLayout.rows.length; i++) {
-                        contentHeight += nodeHeight;
-                        if (i < sectionLayout.gridHeights.length) {
-                            const gridSpace = sectionLayout.gridHeights[i] * channelSpacing;
-                            contentHeight += Math.max(rowSpacing, gridSpace);
-                        } else if (i < sectionLayout.rows.length - 1) {
-                            contentHeight += rowSpacing;
-                        }
-                    }
-                    contentHeight += sectionPadding;  // Bottom padding
-
-                    // Width: based on max nodes per row
-                    const maxNodesInRow = Math.max(...sectionLayout.rows.map(r => r.nodes.length));
-                    const contentWidth = Math.max(
-                        maxNodesInRow * (nodeMinWidth + 20),  // Nodes with spacing
-                        150  // Minimum width for label
-                    );
-
-                    return { width: contentWidth, height: contentHeight };
+                // The plan owns the content size, so the height reserved here
+                // is exactly the height the wires will occupy.
+                const bundle = getSectionPlan(nodesData, sectionKey, style, ActiveGapHeight);
+                if (bundle) {
+                    return { width: bundle.contentWidth, height: bundle.totalHeight };
                 }
             }
 
@@ -3046,95 +2241,538 @@ function calculateNodeContentSize(node, nodesData, style, parentName = null) {
             return { width: 150, height: labelHeight + nodeHeightNoHint + sectionPadding };
         }
     } else if (node.type === 'container') {
-        // Container - combine children
         const childSizes = node.children.map(child =>
             calculateNodeContentSize(child, nodesData, style, parentName)
         );
+        const gutter = getGutterPlan(node, childSizes, style);
 
-        const direction = node.direction || 'row';
-        let width, height;
-
-        if (direction === 'row') {
-            width = childSizes.reduce((sum, s) => sum + s.width, 0) + gap * (childSizes.length - 1);
-            height = Math.max(...childSizes.map(s => s.height));
-        } else {
-            width = Math.max(...childSizes.map(s => s.width));
-            height = childSizes.reduce((sum, s) => sum + s.height, 0) + gap * (childSizes.length - 1);
-        }
-
-        return { width, height };
+        return { width: gutter.contentWidth, height: gutter.contentHeight };
     }
 
     return { width: 100, height: 60 };
 }
 
 /**
- * @brief Renders children of a layout container with content-based sizing.
+ * @brief Creates an unplaced box record for one layout tree node.
  *
- * Uses content-based sizing: each child gets exactly the size it needs,
- * not a proportional share of available space. This produces compact diagrams.
- *
- * For row layout:
- *   - Each child gets its calculated width
- *   - All children share the maximum height (for visual alignment)
- *   - Children are separated by gap (10px)
- *
- * For column layout:
- *   - Each child gets its calculated height
- *   - All children share the maximum width (for visual alignment)
- *   - Children are separated by gap (10px)
- *
- * @pre children must be an array of valid layout nodes (segment or container)
- * @pre direction must be 'row' or 'column'
- * @pre nodesData must contain sections and nodeMap for size calculation
- *
- * @param {Array} children - Child layout nodes to render.
- * @param {string} direction - Layout direction: 'row' or 'column'.
- * @param {number} x - Starting X position for first child.
- * @param {number} y - Starting Y position for first child.
- * @param {number} width - Available width (used for alignment reference).
- * @param {number} height - Available height (used for alignment reference).
- * @param {Object} style - Style configuration with sizing parameters.
- * @param {Array} themeColors - Theme color palette array.
- * @param {number} colorIndex - Current color index for cycling.
- * @param {Object} nodesData - Parsed nodes and connections data.
- * @param {string} parentName - Parent segment name for qualified section lookups.
- * @returns {string} SVG markup for all children.
+ * @param {Object} node - Layout tree node.
+ * @param {number} x - Page X of the box's left edge.
+ * @param {number} y - Page Y of the box's top edge.
+ * @param {number} width - Box width in pixels.
+ * @param {number} height - Box height in pixels.
+ * @returns {Object} A placed box, with its contents still to be filled in.
  */
-function renderLayoutChildren(children, direction, x, y, width, height, style, themeColors, colorIndex, nodesData, parentName) {
-    let svg = '';
-    const gap = 10;
-    const count = children.length;
+function newPlacedBox(node, x, y, width, height) {
+    console.assert(node && node.type, 'a layout node must carry a type');
+    console.assert(width >= 0 && height >= 0, 'a box cannot have negative size');
 
-    if (count === 0) return svg;
+    return {
+        type: node.type,
+        name: node.name || null,
+        level: ActiveLevels ? (ActiveLevels.tree.byNode.get(node) || null) : null,
+        direction: node.direction || 'row',
+        x: x,
+        y: y,
+        width: width,
+        height: height,
+        color: null,
+        sectionKey: null,
+        bundle: null,
+        bounds: null,
+        gutter: null,
+        children: []
+    };
+}
 
-    // Calculate content-based sizes for each child
-    const childSizes = children.map(child =>
+/**
+ * @brief Attaches the section plan a leaf segment draws from.
+ *
+ * The section key is resolved the way the parser writes it, preferring the
+ * parent-qualified form and falling back to the bare name.
+ *
+ * @param {Object} box - Placed box to fill in.
+ * @param {Object} node - Layout tree node for that box.
+ * @param {Object} inner - Content rectangle { x, y, width, height }.
+ * @param {Object} style - Style configuration.
+ * @param {Object} nodesData - Parsed nodes and connections data.
+ * @param {string} parentName - Enclosing segment name, or null.
+ * @returns {void}
+ */
+function attachSectionPlan(box, node, inner, style, nodesData, parentName) {
+    console.assert(box.type === 'segment', 'only a segment owns a section');
+    console.assert(nodesData && nodesData.sections, 'nodesData must be parsed');
+
+    let sectionKey = parentName ? parentName + ':' + node.name : node.name;
+    if (!nodesData.sections[sectionKey] && parentName) sectionKey = node.name;
+    if (!nodesData.sections[sectionKey]) return;
+
+    const bundle = getSectionPlan(nodesData, sectionKey, style, ActiveGapHeight);
+    if (!bundle) return;
+
+    box.sectionKey = sectionKey;
+    box.bounds = inner;
+    box.bundle = bundle;
+}
+
+/**
+ * @brief Lays a container's children out along its direction.
+ *
+ * Every position comes from the container's gutter plan, which the sizing pass
+ * read too. One plan serving both is what stops the space reserved for a
+ * gutter and the space given to it from drifting apart.
+ *
+ * @pre The layout node must be the one that owns these children.
+ *
+ * @param {Object} node - Layout tree node for the container.
+ * @param {Array} children - Child layout nodes.
+ * @param {Object} inner - Content rectangle to lay out within.
+ * @param {Object} style - Style configuration.
+ * @param {number} colorIndex - Colour index of the first child.
+ * @param {Object} nodesData - Parsed nodes and connections data.
+ * @param {string} parentName - Enclosing segment name, or null.
+ * @returns {Object} { items, gutter } where items are stack entries
+ *                   { node, box, colorIndex, parentName } in drawing order.
+ */
+function placeLayoutChildren(node, children, inner, style, colorIndex, nodesData, parentName) {
+    console.assert(children.length > 0, 'placeLayoutChildren needs children');
+
+    const sizes = children.map(child =>
         calculateNodeContentSize(child, nodesData, style, parentName)
     );
+    const gutter = getGutterPlan(node, sizes, style);
+    const placed = [];
 
-    if (direction === 'row') {
-        // Row direction: children side by side, all get the max height
-        const maxHeight = Math.max(...childSizes.map(s => s.height));
-        let currentX = x;
-
-        children.forEach((child, i) => {
-            const childWidth = childSizes[i].width;
-            svg += renderLayoutNode(child, currentX, y, childWidth, maxHeight, style, themeColors, colorIndex + i, nodesData, parentName);
-            currentX += childWidth + gap;
+    children.forEach((child, i) => {
+        const rowIdx = gutter.firstContentRow + (gutter.direction === 'row' ? 0 : i);
+        placed.push({
+            node: child,
+            box: newPlacedBox(child,
+                inner.x + gutter.childOffsets[i],
+                inner.y + gutter.rowOffsets[rowIdx],
+                gutter.childWidths[i],
+                gutter.rowHeights[rowIdx]),
+            colorIndex: colorIndex + i,
+            parentName: parentName
         });
-    } else {
-        // Column direction: children stacked, all get the max width
-        const maxWidth = Math.max(...childSizes.map(s => s.width));
-        let currentY = y;
+    });
 
-        children.forEach((child, i) => {
-            const childHeight = childSizes[i].height;
-            svg += renderLayoutNode(child, x, currentY, maxWidth, childHeight, style, themeColors, colorIndex + i, nodesData, parentName);
-            currentY += childHeight + gap;
-        });
+    return { items: placed, gutter: gutter };
+}
+
+/**
+ * @brief Places every box on the page without emitting any SVG.
+ *
+ * This is the plan phase's placement pass. Nothing may be drawn until it has
+ * finished, because a boundary port sits on a box edge and its X is an input
+ * to the plans on both sides of the gutter it crosses.
+ *
+ * Walked with an explicit stack rather than by recursion, per P10 rule 1.
+ * Children are pushed in reverse so the stack pops them in drawing order,
+ * which makes `order` a depth-first pre-order: every box after the box it
+ * sits inside.
+ *
+ * @pre ActiveGapHeight must already hold the diagram's uniform gap height.
+ *
+ * @param {Object} layoutTree - Parsed layout tree, may be null.
+ * @param {Object} origin - Page position { x, y } of the root box.
+ * @param {Object} size - Root box size { width, height }.
+ * @param {Object} style - Style configuration.
+ * @param {Array} themeColors - Theme colour palette.
+ * @param {Object} nodesData - Parsed nodes and connections data.
+ * @returns {Object|null} { root, order }, or null when there is no layout.
+ */
+function placeLayout(layoutTree, origin, size, style, themeColors, nodesData) {
+    if (!layoutTree) return null;
+    console.assert(themeColors && themeColors.length > 0, 'a theme needs colours');
+    console.assert(size.width > 0 && size.height > 0, 'the page needs a size');
+
+    const root = newPlacedBox(layoutTree, origin.x, origin.y, size.width, size.height);
+    const order = [];
+    const stack = [{ node: layoutTree, box: root, colorIndex: 0, parentName: null }];
+    let guard = 0;
+
+    while (stack.length > 0 && guard < MAX_LAYOUT_NODES) {
+        guard++;
+        const item = stack.pop();
+        const node = item.node;
+        const box = item.box;
+        order.push(box);
+
+        let inner = { x: box.x, y: box.y, width: box.width, height: box.height };
+        let childColorIndex = item.colorIndex;
+        let childParentName = item.parentName;
+
+        if (node.type === 'segment') {
+            box.color = themeColors[item.colorIndex % themeColors.length];
+            inner = {
+                x: box.x + LAYOUT_PADDING,
+                y: box.y + SECTION_LABEL_HEIGHT,
+                width: box.width - LAYOUT_PADDING * 2,
+                height: box.height - SECTION_LABEL_HEIGHT - LAYOUT_PADDING
+            };
+            childColorIndex = item.colorIndex + 1;
+            childParentName = node.name;
+        }
+
+        const children = node.children || [];
+        if (children.length > 0) {
+            const laid = placeLayoutChildren(node, children, inner, style,
+                childColorIndex, nodesData, childParentName);
+            box.children = laid.items.map(entry => entry.box);
+            box.gutter = laid.gutter;
+            box.bounds = inner;
+            for (let i = laid.items.length - 1; i >= 0; i--) stack.push(laid.items[i]);
+            continue;
+        }
+
+        if (node.type === 'segment' && nodesData) {
+            attachSectionPlan(box, node, inner, style, nodesData, item.parentName);
+        }
     }
 
+    console.assert(guard < MAX_LAYOUT_NODES, 'layout placement hit its bound');
+    return { root: root, order: order };
+}
+
+/**
+ * @brief Page X of the origin a placed box's plan is drawn from.
+ *
+ * A section narrower than its box is centred in it, exactly as renderSection()
+ * draws it, and a container's gutter starts at its content edge.
+ *
+ * @param {Object} box - Placed box with bounds set.
+ * @returns {number} Page X of local X zero.
+ */
+function planOriginX(box) {
+    console.assert(box.bounds, 'a planned box must have content bounds');
+    if (box.bundle) return sectionOriginX(box.bundle, box.bounds);
+    return box.bounds.x;
+}
+
+/**
+ * @brief Page X of a section's local X zero, centred in its content box.
+ *
+ * The one place this is computed. The join walk and renderSection() must
+ * agree on it exactly, or every wire crossing the section's edge breaks.
+ *
+ * @param {Object} bundle - Section plan bundle.
+ * @param {Object} bounds - Section content box { x, width }.
+ * @returns {number} Page X.
+ */
+function sectionOriginX(bundle, bounds) {
+    console.assert(bundle.contentWidth > 0, 'a section needs a width');
+    return bounds.x + Math.max(0, (bounds.width - bundle.contentWidth) / 2);
+}
+
+/**
+ * @brief Routes every level to the boundary port Xs its parent chose.
+ *
+ * Boxes are visited parents first, which is the order placement records them
+ * in. Each container's final plan fixes where every wire meets each child
+ * box's edge, and that X, in the child's own space, is what the child routes
+ * to when its turn comes. Box sizes are not touched, so the result is joined
+ * whether or not it fits; the caller sizes again when it does not.
+ *
+ * @pre placement must come from placeLayout() in this round.
+ *
+ * @param {Object} placement - { root, order } from placeLayout().
+ * @returns {Object} { hints, fits } where hints is the port X per level and
+ *                   net, and fits is false if any level outgrew its room.
+ */
+function joinBoundaries(placement) {
+    console.assert(placement && Array.isArray(placement.order), 'joinBoundaries needs a placement');
+
+    const hints = {};
+    let fits = true;
+
+    for (const box of placement.order) {
+        if (!box.level) continue;
+        const own = hints[box.level.id] || {};
+
+        if (box.bundle && box.bundle.hasBoundary) {
+            const plan = box.bundle.replan(own);
+            fits = fits && planFits(plan, box.bundle.gapHeights, box.bundle.contentWidth);
+            box.bundle = Object.assign({}, box.bundle, { plan: plan });
+            continue;
+        }
+
+        if (!box.gutter || !box.gutter.plan) continue;
+        if (box.gutter.hasBoundary) {
+            const plan = box.gutter.replan(own);
+            fits = fits && planFits(plan, box.gutter.gapHeights, Infinity);
+            box.gutter = Object.assign({}, box.gutter, { plan: plan });
+        }
+
+        // Hand each wire's crossing point down to the child box it enters.
+        const childById = {};
+        for (const child of box.children) {
+            if (child.level) childById[child.level.id] = child;
+        }
+        const origin = planOriginX(box);
+        for (const net of box.gutter.plan.nets) {
+            for (const [nodeId, x] of [[net.from, net.sourceX], [net.to, net.targetX]]) {
+                const child = childById[nodeId];
+                if (!child || !child.bounds) continue;
+                if (!hints[nodeId]) hints[nodeId] = {};
+                hints[nodeId][net.id] = origin + x - planOriginX(child);
+            }
+        }
+    }
+
+    return { hints: hints, fits: fits };
+}
+
+/**
+ * @brief Stretches wires that end on a boundary row out to the box edge.
+ *
+ * A boundary row sits on the inside of the box's label strip or padding, so
+ * the wire stops short of the edge where the level above picks it up. Only
+ * the end stub moves, and it is vertical, so the path keeps its shape.
+ *
+ * @param {Object} emitted - Result of OrcaRouter.emitSection(), mutated.
+ * @param {Object} plan - The plan it was emitted from.
+ * @param {Object} edges - Page Y { top, bottom } of the box edges.
+ * @returns {void}
+ */
+function stretchBoundaryEnds(emitted, plan, edges) {
+    console.assert(edges && typeof edges.top === 'number', 'edges must give a top');
+
+    const byId = {};
+    for (const net of plan.nets) byId[net.id] = net;
+
+    for (const line of emitted.polylines) {
+        const net = byId[line.netId];
+        if (!net) continue;
+        if (net.source.boundary) {
+            line.points[0].y = net.sourceRow === 0 ? edges.top : edges.bottom;
+        }
+        if (net.target.boundary) {
+            line.points[line.points.length - 1].y = net.targetRow === 0 ? edges.top : edges.bottom;
+        }
+    }
+
+    // Rebuild the checked segments from the stretched paths.
+    emitted.segments = [];
+    for (const line of emitted.polylines) {
+        for (let i = 0; i + 1 < line.points.length; i++) {
+            const a = line.points[i];
+            const b = line.points[i + 1];
+            emitted.segments.push({
+                netId: line.netId,
+                orientation: Math.abs(a.y - b.y) < 1e-6 ? 'h' : 'v',
+                x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+                dashed: line.dashed
+            });
+        }
+    }
+}
+
+/**
+ * @brief Records where a level's wires meet box edges, for the join check.
+ *
+ * Every wire that ends on a boundary row has to meet a wire the level above
+ * ends on that box's edge, at the same point. Only the harness asks.
+ *
+ * @param {Object} emitted - Emitted, stretched geometry in local X.
+ * @param {Object} plan - The plan it was emitted from.
+ * @param {number} originX - Page X of local X zero.
+ * @param {Function} continues - Returns true for a node id whose wire carries
+ *                               on inside that box.
+ * @returns {void}
+ */
+function recordJoinEnds(emitted, plan, originX, continues) {
+    if (typeof window === 'undefined' || !window.ORCA_VERIFY || !window.OrcaCheck) return;
+    if (!window.OrcaCheck.joinEnds) window.OrcaCheck.joinEnds = { boundary: [], box: [] };
+
+    const byId = {};
+    for (const net of plan.nets) byId[net.id] = net;
+
+    for (const line of emitted.polylines) {
+        const net = byId[line.netId];
+        if (!net) continue;
+        const first = line.points[0];
+        const last = line.points[line.points.length - 1];
+        for (const [node, point] of [[net.source, first], [net.target, last]]) {
+            const end = { key: net.id, x: originX + point.x, y: point.y };
+            if (node.boundary) window.OrcaCheck.joinEnds.boundary.push(end);
+            else if (continues(node.id, net.id)) window.OrcaCheck.joinEnds.box.push(end);
+        }
+    }
+}
+
+/**
+ * @brief Counts boundary ends with no partner across the box edge.
+ * @returns {void}
+ */
+function checkJoins() {
+    if (typeof window === 'undefined' || !window.ORCA_VERIFY || !window.OrcaCheck) return;
+    const ends = window.OrcaCheck.joinEnds || { boundary: [], box: [] };
+
+    /**
+     * @brief Counts entries of one list with no match in the other.
+     * @param {Array} list - Ends to look up.
+     * @param {Array} other - Ends to match against.
+     * @returns {number} Unmatched count.
+     */
+    function unmatched(list, other) {
+        return list.filter(a => !other.some(b =>
+            b.key === a.key && Math.abs(b.x - a.x) < 1 && Math.abs(b.y - a.y) < 1)).length;
+    }
+
+    window.OrcaCheck.joins = {
+        ends: ends.boundary.length,
+        unjoined: unmatched(ends.boundary, ends.box) + unmatched(ends.box, ends.boundary)
+    };
+}
+
+/**
+ * @brief Escapes text for use inside SVG markup or an attribute value.
+ * @param {*} value - Value to escape.
+ * @returns {string} Text with &, <, >, " and ' replaced by entities.
+ */
+function escapeXml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/**
+ * @brief Emits the SVG for a placement, boxes first and contents after.
+ *
+ * This is the whole emit phase for the box tree. It reads the placement and
+ * decides nothing, so every position it draws was fixed by the plan phase.
+ *
+ * @pre placement must come from placeLayout().
+ *
+ * @param {Object} placement - { root, order } from placeLayout().
+ * @param {Object} style - Style configuration.
+ * @param {Array} themeColors - Theme colour palette.
+ * @returns {string} SVG markup for every segment box, label and section.
+ */
+function emitPlacement(placement, style, themeColors) {
+    if (!placement) return '';
+    console.assert(Array.isArray(placement.order), 'a placement must carry an order');
+
+    let svg = '';
+    let labels = '';
+
+    for (const box of placement.order) {
+        if (box.type !== 'segment') continue;
+
+        svg += `<rect x="${box.x}" y="${box.y}" width="${box.width}" height="${box.height}"
+            rx="${style['section-radius']}" ry="${style['section-radius']}"
+            fill="#ffffff" stroke="${box.color}" stroke-width="${style['section-border']}"/>`;
+
+        // A wire entering through the top edge passes the label, so labels go
+        // on last over a backing that breaks the wire rather than the text.
+        // The width is estimated, because nothing here can measure text.
+        if (box.name) {
+            const labelText = style.uppercase ? box.name.toUpperCase() : box.name;
+            const centerX = box.x + box.width / 2;
+            // WHY: a style value is any string the user typed, and this one
+            // lands in markup, so it must be a number before it gets there.
+            const fontSize = Number(style['font-size']);
+            const labelSize = (Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 14) + 2;
+            const backing = labelText.length * labelSize * 0.62 + 12;
+            labels += `<rect x="${centerX - backing / 2}" y="${box.y + 6}" width="${backing}"
+                height="${labelSize + 4}" fill="#ffffff"/>`;
+            labels += `<text x="${centerX}" y="${box.y + 20}" class="section-label" fill="${box.color}">
+                ${escapeXml(labelText)}
+            </text>`;
+        }
+
+        if (box.bundle) {
+            const edges = { top: box.y, bottom: box.y + box.height };
+            svg += renderSection(box.bundle, box.bounds, edges, style, box.color);
+        }
+    }
+
+    // Gutters go on last so a wire between two boxes is not hidden under the
+    // box drawn after it.
+    for (const box of placement.order) {
+        if (box.gutter) svg += renderGutter(box, style, themeColors);
+    }
+
+    checkJoins();
+    return svg + labels;
+}
+
+/**
+ * @brief Draws the wires one container level routes between its child boxes.
+ *
+ * The boxes themselves are drawn by the placement walk. This adds only the
+ * gutter traffic, which is the wiring that used to have nowhere to go.
+ *
+ * @pre box.gutter must come from getGutterPlan() and box.bounds must be set.
+ *
+ * @param {Object} box - Placed container box.
+ * @param {Object} style - Style configuration.
+ * @param {Array} themeColors - Theme colour palette.
+ * @returns {string} SVG markup for this level's wires.
+ */
+function renderGutter(box, style, themeColors) {
+    const gutter = box.gutter;
+    if (!gutter.plan) return '';
+    console.assert(box.bounds, 'a routed container must have content bounds');
+
+    const rowTops = gutter.rowOffsets.map(offset => box.bounds.y + offset);
+    const emitted = OrcaRouter.emitSection(gutter.plan, rowTops, gutter.rowHeights);
+    stretchBoundaryEnds(emitted, gutter.plan, { top: box.y, bottom: box.y + box.height });
+
+    const color = box.color || themeColors[0];
+    const lineThickness = style['line-thickness'] || 2;
+    const cornerRadius = gutter.geometry.cornerRadius;
+
+    if (typeof window !== 'undefined' && window.ORCA_VERIFY) {
+        if (!window.OrcaCheck) window.OrcaCheck = { sections: [] };
+        if (!window.OrcaCheck.gutters) window.OrcaCheck.gutters = [];
+
+        // Every child box is an obstacle, so a gutter wire crossing one is the
+        // same defect as a section wire crossing a node.
+        const boxOutlines = box.children.map(child => ({
+            id: child.name || 'anon',
+            x0: child.x - box.bounds.x,
+            y0: child.y,
+            x1: child.x - box.bounds.x + child.width,
+            y1: child.y + child.height
+        }));
+
+        window.OrcaCheck.gutters.push({
+            level: box.name || 'anon',
+            nets: gutter.plan.nets.length,
+            tracksPerGap: gutter.plan.gapTrackCounts,
+            overlaps: OrcaRouter.findOverlaps(emitted.segments, 1.0).length,
+            boxHits: OrcaRouter.findNodeCollisions(emitted.segments, boxOutlines, 1.0).length
+        });
+
+        // A wire ending on a child box carries on inside it when that child
+        // routes a piece of the same net.
+        recordJoinEnds(emitted, gutter.plan, box.bounds.x,
+            (nodeId, key) => continuesInside({ kind: 'box', id: nodeId }, key));
+    }
+
+    let svg = '<g transform="translate(' + box.bounds.x + ',0)">';
+
+    for (const line of emitted.polylines) {
+        svg += '<path d="' + OrcaRouter.pathData(line.points, cornerRadius) + '"'
+            + ' fill="none" stroke="' + color + '"'
+            + ' stroke-width="' + lineThickness + '"'
+            + ' stroke-linecap="round" stroke-linejoin="round"'
+            + (line.dashed ? ' stroke-dasharray="5,5"' : '') + '/>';
+    }
+
+    for (const dot of emitted.junctions) {
+        svg += '<circle cx="' + dot.x + '" cy="' + dot.y + '" r="4" fill="' + color + '"/>';
+    }
+
+    for (const arrow of emitted.arrows) {
+        svg += renderArrow(arrow.x, arrow.y, arrow.direction, color, 8);
+    }
+
+    svg += '</g>';
     return svg;
 }
 
@@ -3348,7 +2986,7 @@ function generatePreview() {
             // Parse inputs
             const style = parseStyle(Elements.styleInput.value);
             const layout = parseLayout(Elements.layoutInput.value);
-            const nodesData = parseNodes(Elements.nodesInput.value);
+            const nodesData = parseNodes(Elements.nodesInput.value, layout);
             
             // Store in app state
             AppState.styleConfig = style;
@@ -3375,7 +3013,35 @@ function generatePreview() {
 
             const nodeCount = nodesData.nodes.length;
             const connCount = nodesData.connections.length;
-            setStatus('Preview generated', 'success', `${nodeCount} nodes, ${connCount} connections`);
+            const detail = `${nodeCount} nodes, ${connCount} connections`;
+
+            // An endpoint that cannot be resolved used to vanish without a
+            // word, which is how every cross-section wire stayed missing.
+            if (typeof window !== 'undefined' && window.ORCA_VERIFY) {
+                const levels = LastDiagramPlan.levels;
+                window.OrcaDebug = {
+                    errors: nodesData.errors,
+                    levelErrors: levels.errors,
+                    levels: Object.keys(levels.byLevel).map(id => ({
+                        level: levels.tree.boxes[id] === levels.tree.root
+                            ? 'root'
+                            : (levels.tree.boxes[id].name || 'anon'),
+                        kind: levels.tree.boxes[id].kind,
+                        pieces: levels.byLevel[id].length
+                    }))
+                };
+            }
+            const levelErrors = LastDiagramPlan ? LastDiagramPlan.levels.errors : [];
+            if (nodesData.errors.length > 0) {
+                setStatus('Preview generated with unresolved links', 'error',
+                    `${detail}, ${nodesData.errors.length} unresolved`);
+                showModal('Unresolved connections', nodesData.errors.concat(levelErrors).join('\n'));
+            } else if (levelErrors.length > 0) {
+                setStatus('Preview generated with routing warnings', 'error', detail);
+                showModal('Routing warnings', levelErrors.join('\n'));
+            } else {
+                setStatus('Preview generated', 'success', detail);
+            }
             
         } catch (error) {
             console.error('Generation error:', error);
