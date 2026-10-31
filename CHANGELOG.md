@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-31
+
+### Fixed
+
+- A wire between two vertically aligned nodes now runs straight down. The gap separation pass treated a net's own source stub and target drop as two wires sharing a column and pushed them apart, which drew a sideways jog. Test "a wire between two aligned nodes keeps its ends in one column".
+
 ## 2026-10-30
 
 ### Added

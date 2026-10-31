@@ -400,7 +400,10 @@
      * The loop is bounded. Entries with nowhere left to go are left where they
      * are rather than looping forever.
      *
-     * @param {Array} entries - { x, minX, maxX, movable, commit } records.
+     * Two entries of the same net never conflict. A net's own stub and drop
+     * meeting in one column is a straight wire, not a collision.
+     *
+     * @param {Array} entries - { x, minX, maxX, movable, commit, netId } records.
      * @param {number} minSeparation - Column spacing to achieve.
      * @returns {void}
      */
@@ -415,6 +418,10 @@
             for (let i = 0; i + 1 < entries.length; i++) {
                 const left = entries[i];
                 const right = entries[i + 1];
+                // WHY: a net's source stub and target drop share a gap when the
+                // wire runs straight down, and separating them drew a jog into
+                // every wire between two aligned nodes.
+                if (left.netId !== undefined && left.netId === right.netId) continue;
                 const deficit = minSeparation - (right.x - left.x);
                 if (deficit <= EPSILON) continue;
 
@@ -777,6 +784,7 @@
 
             const sourceRange = portRange(net.source);
             addVertical(firstGap, {
+                netId: net.id,
                 x: net.sourceX,
                 minX: sourceRange.minX,
                 maxX: sourceRange.maxX,
@@ -789,6 +797,7 @@
             if (!busOwner || busOwner.members[0] === net) {
                 const targetRange = portRange(net.target);
                 addVertical(lastGap, {
+                    netId: busOwner ? 'bus:' + net.busKey : net.id,
                     x: net.targetX,
                     minX: targetRange.minX,
                     maxX: targetRange.maxX,
