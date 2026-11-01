@@ -81,6 +81,9 @@ USV <> ground
 | `<>` | Arrows both ways. |
 | `->`, `<-`, `<->` | The same, dashed. |
 
+- A trace is one wire across every box it crosses, plus any wires it shares a bus with. A trace has one colour.
+- Write `{#hex}` after a target to colour that wire's trace: `ESC Array > T1, T2 {#e6194b}`. Only `#rgb` and `#rrggbb` are accepted.
+
 ## Linking across sections
 
 - A directional line (`>`, `<`, `->`, `<-`) creates and links nodes inside its own section only.
@@ -98,6 +101,8 @@ Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px
 | Setting | Range | Default | What it does |
 |---|---|---|---|
 | `theme` | `default`, `monochrome`, `engineering`, `warm`, `cool`, `high-contrast` | `engineering` | Colours given to the boxes in order. |
+| `line-theme` | `box`, `kelly`, `okabe-ito`, `custom`, or any `theme` name | `box` | Wire colours. `box` draws each wire in its box colour. Any other value gives every trace its own colour from that palette. |
+| `line-palette` | comma-separated hex colours | none | The palette `line-theme: custom` uses, for example `#e6194b, #3cb44b, #4363d8`. |
 | `font` | any Google Font | `Roboto Mono` | Node and box label font. |
 | `font-weight` | 100 to 900 | `500` | Node and box label weight. |
 | `font-size` | any number | `14` | Node label size in px. Box labels are 2px larger. |

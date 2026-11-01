@@ -586,6 +586,8 @@
                 dashed: !!conn.dashed,
                 continuesFrom: !!conn.continuesFrom,
                 continuesTo: !!conn.continuesTo,
+                // Caller's own wire identity, carried through untouched for colouring.
+                traceIndex: conn.traceIndex,
                 source: source.node,
                 target: target.node,
                 sourceRow: source.rowIdx,
@@ -783,20 +785,21 @@
             const lastGap = net.gaps[net.gaps.length - 1];
 
             const sourceRange = portRange(net.source);
-            addVertical(firstGap, {
+            net.sourceEntry = {
                 netId: net.id,
                 x: net.sourceX,
                 minX: sourceRange.minX,
                 maxX: sourceRange.maxX,
                 movable: true,
                 commit: function (x) { net.sourceX = x; }
-            });
+            };
+            addVertical(firstGap, net.sourceEntry);
 
             // A bus shares one drop, so only the first member registers it.
             const busOwner = net.busKey ? buses[net.busKey] : null;
             if (!busOwner || busOwner.members[0] === net) {
                 const targetRange = portRange(net.target);
-                addVertical(lastGap, {
+                net.targetEntry = {
                     netId: busOwner ? 'bus:' + net.busKey : net.id,
                     x: net.targetX,
                     minX: targetRange.minX,
@@ -809,7 +812,8 @@
                             net.targetX = x;
                         }
                     }
-                });
+                };
+                addVertical(lastGap, net.targetEntry);
             }
 
             // A crossing occupies a column in the gap above and below it.
@@ -840,6 +844,48 @@
 
         for (const gapIdx in gapVerticals) {
             separateGapVerticals(gapVerticals[gapIdx], geometry.portPitch);
+        }
+
+        // ---------------------------------------------------------------------
+        // 8.4c Straighten wires that need no horizontal at all.
+        //
+        // WHY: ports are spread around their own node's centre, so the two
+        // ends of a wire between near-aligned nodes, or between a box port
+        // and the boundary port the level above fixed, landed a few pixels
+        // apart and drew a sideways jog where one straight drop would do.
+        // ---------------------------------------------------------------------
+        for (const net of nets) {
+            straightenNet(net);
+        }
+
+        /**
+         * @brief Moves one end of a single-gap wire onto the other's column.
+         *
+         * A pinned end (min equal to max) never moves. Otherwise the target
+         * moves first, then the source. A move is taken only when the new X is
+         * inside the moving end's range and keeps portPitch from every other
+         * vertical in the gap.
+         *
+         * @param {Object} net - Net from this plan.
+         * @returns {void}
+         */
+        function straightenNet(net) {
+            if (net.gaps.length !== 1 || net.busKey) return;
+            const src = net.sourceEntry;
+            const dst = net.targetEntry;
+            if (!src || !dst || Math.abs(src.x - dst.x) <= EPSILON) return;
+
+            const others = gapVerticals[net.gaps[0]].filter(e => e !== src && e !== dst);
+            const tries = [[dst, src.x], [src, dst.x]];
+            for (const [entry, x] of tries) {
+                if (entry.maxX - entry.minX <= EPSILON) continue;
+                if (x < entry.minX - EPSILON || x > entry.maxX + EPSILON) continue;
+                const crowded = others.some(e => Math.abs(e.x - x) < geometry.portPitch - EPSILON);
+                if (crowded) continue;
+                entry.x = x;
+                entry.commit(x);
+                return;
+            }
         }
 
         // ---------------------------------------------------------------------

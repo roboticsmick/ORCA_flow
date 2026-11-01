@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-01
+
+### Added
+
+- Trace colours, off by default. `line-theme: kelly`, `okabe-ito`, any `theme` name, or `custom` with `line-palette` gives every trace its own colour. A trace is one wire across every box level plus any wires sharing its bus. With `line-theme` left at `true` or `box`, every fixture's SVG is byte-identical to before.
+- Per-wire colour override, `{#hex}` after a target. Non-hex values and colours after a source are reported in the popup and never reach the SVG.
+- `js/traces.js`, a pure module for trace grouping and colour assignment, with `test/traces.test.js`.
+- `test/fixtures/colours.flow`, and a harness check that every drawn part of one trace has one colour.
+
+### Fixed
+
+- A wire whose two ends sit a few pixels apart, including where it crosses a box edge, now drops straight instead of jogging sideways. A straightening pass in `js/router.js` moves one end onto the other's column when it is in reach and clear of other wires. Xbee <> Ground Station and `ROV <> ground` on `cross.flow` are now straight.
+
 ## 2026-10-31
 
 ### Fixed

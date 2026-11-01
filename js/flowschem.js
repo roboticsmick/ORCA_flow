@@ -136,8 +136,23 @@ const Themes = {
     'high-contrast': [
         '#ff0000', '#00ff00', '#0000ff', '#ffff00',
         '#ff00ff', '#00ffff', '#ff8800', '#8800ff'
+    ],
+    // Kelly's 22 colours of maximum contrast, less white, for wires.
+    kelly: [
+        '#222222', '#f3c300', '#875692', '#f38400', '#a1caf1', '#be0032',
+        '#c2b280', '#848482', '#008856', '#e68fac', '#0067a5', '#f99379',
+        '#604e97', '#f6a600', '#b3446c', '#dcd300', '#882d17', '#8db600',
+        '#654522', '#e25822', '#2b3d26'
+    ],
+    // Okabe and Ito, distinct under the common forms of colour blindness.
+    'okabe-ito': [
+        '#e69f00', '#56b4e9', '#009e73', '#f0e442',
+        '#0072b2', '#d55e00', '#cc79a7', '#000000'
     ]
 };
+
+/** Per-wire colours for the current render, or null when wires take box colours. */
+let ActiveTraceColours = null;
 
 // =============================================================================
 // 5. LINE STYLE PATTERNS (for accessibility)
@@ -476,11 +491,28 @@ function collectLayoutScope(layoutTree) {
  * `section:Name/hint`. The qualifier names the section the node lives in, which
  * is how an endpoint reaches out of the block it is written in.
  *
+ * Any form may end in `{#hex}`, the colour of the wire to this target. It is
+ * kept only when OrcaTraces.isHexColour() accepts it, so nothing else reaches
+ * SVG markup.
+ *
  * @param {string} str - Raw endpoint text.
- * @returns {Object} { qualifier, name, hint }.
+ * @returns {Object} { qualifier, name, hint, colour, colourError }.
  */
 function parseEndpoint(str) {
-    const trimmed = (str || '').trim();
+    let trimmed = (str || '').trim();
+    let colour = null;
+    let colourError = null;
+    const brace = trimmed.match(/\{([^}]*)\}\s*$/);
+    if (brace) {
+        trimmed = trimmed.slice(0, brace.index).trim();
+        const value = brace[1].trim();
+        if (OrcaTraces.isHexColour(value)) {
+            colour = value;
+        } else {
+            colourError = "Wire colour '{" + value + "}' on '" + trimmed
+                + "' is not a hex colour such as {#e6194b}.";
+        }
+    }
     const colon = trimmed.indexOf(':');
     const qualifier = colon > 0 ? trimmed.slice(0, colon).trim() : null;
     const rest = colon > 0 ? trimmed.slice(colon + 1).trim() : trimmed;
@@ -488,7 +520,9 @@ function parseEndpoint(str) {
     return {
         qualifier: qualifier,
         name: parts[0].trim(),
-        hint: parts.length > 1 ? parts[1].trim() : null
+        hint: parts.length > 1 ? parts[1].trim() : null,
+        colour: colour,
+        colourError: colourError
     };
 }
 
@@ -630,6 +664,7 @@ function parseNodes(input, layoutTree) {
         if (currentSection) {
             const sectionKey = currentParent ? `${currentParent}:${currentSection}` : currentSection;
             const parsed = parseNodeLine(trimmed, sectionKey, currentRow);
+            if (parsed) reportColourErrors(parsed, result.errors);
 
             if (parsed && needsLinkResolution(parsed)) {
                 // Reaches out of this block. Nothing is declared here, so the
@@ -699,7 +734,8 @@ function parseNodes(input, layoutTree) {
                         from: fromId,
                         to: toId,
                         type: normalizedType,
-                        dashed: parsed.dashed
+                        dashed: parsed.dashed,
+                        colour: target.colour
                     };
                     result.connections.push(connection);
 
@@ -715,7 +751,30 @@ function parseNodes(input, layoutTree) {
 
     resolvePendingLinks(result, pendingLinks, scope);
 
+    // Trace colouring and gutter pieces both key a wire by this index.
+    result.connections.forEach((conn, index) => { conn.index = index; });
+
     return result;
+}
+
+/**
+ * @brief Reports wire colours that are not hex, or that sit on a source.
+ *
+ * A colour belongs to the wire into one target, so on the left of a line it
+ * has no single wire to name.
+ *
+ * @param {Object} parsed - Output of parseNodeLine().
+ * @param {Array} errors - Parse errors, appended to.
+ * @returns {void}
+ */
+function reportColourErrors(parsed, errors) {
+    const source = parsed.sourceRaw;
+    if (source.colour || source.colourError) {
+        errors.push("A wire colour goes after a target, not after '" + source.name + "'.");
+    }
+    for (const target of parsed.targetsRaw) {
+        if (target.colourError) errors.push(target.colourError);
+    }
 }
 
 /**
@@ -802,6 +861,7 @@ function resolvePendingLinks(result, pendingLinks, scope) {
                 to: to.id,
                 type: link.parsed.connectionType || 'to',
                 dashed: link.parsed.dashed,
+                colour: rawTarget.colour,
                 fromKind: from.kind,
                 toKind: to.kind
             };
@@ -854,7 +914,8 @@ function parseNodeLine(line, section, row) {
                 targets: targets.map(t => ({
                     id: generateNodeId(t.name, section),
                     name: t.name,
-                    hint: t.hint
+                    hint: t.hint,
+                    colour: t.colour
                 })),
                 targetsRaw: targets,
                 connectionType: type,
@@ -1120,7 +1181,8 @@ function getSectionPlan(nodesData, sectionKey, style, uniformGapHeight = 0) {
                     from: node.id,
                     to: conn.to,
                     type: conn.type,
-                    dashed: conn.dashed
+                    dashed: conn.dashed,
+                    traceIndex: conn.index
                 });
             }
         }
@@ -1542,6 +1604,7 @@ function boundaryConnections(levelId, ids, accept) {
             to: to,
             type: piece.connection.type,
             dashed: !!piece.connection.dashed,
+            traceIndex: piece.connection.index,
             continuesFrom: continuesInside(piece.from, piece.key),
             continuesTo: continuesInside(piece.to, piece.key)
         });
@@ -1869,11 +1932,12 @@ function renderSection(bundle, bounds, edges, style, color) {
     const arrowSize = 8;
     const junctionRadius = 4;
 
+    const colourOf = wireColourLookup(plan, color);
     let svg = '<g transform="translate(' + offsetX + ',0)">';
 
     for (const line of emitted.polylines) {
         const d = OrcaRouter.pathData(line.points, cornerRadius);
-        svg += '<path d="' + d + '" fill="none" stroke="' + color + '"'
+        svg += '<path d="' + d + '" fill="none" stroke="' + colourOf(line.netId) + '"'
             + ' stroke-width="' + lineThickness + '"'
             + ' stroke-linecap="round" stroke-linejoin="round"'
             + (line.dashed ? ' stroke-dasharray="5,5"' : '') + '/>';
@@ -1881,11 +1945,11 @@ function renderSection(bundle, bounds, edges, style, color) {
 
     for (const dot of emitted.junctions) {
         svg += '<circle cx="' + dot.x + '" cy="' + dot.y + '" r="' + junctionRadius
-            + '" fill="' + color + '"/>';
+            + '" fill="' + colourOf('bus:' + dot.busKey) + '"/>';
     }
 
     for (const arrow of emitted.arrows) {
-        svg += renderArrow(arrow.x, arrow.y, arrow.direction, color, arrowSize);
+        svg += renderArrow(arrow.x, arrow.y, arrow.direction, colourOf(arrow.netId), arrowSize);
     }
 
     svg += '</g>';
@@ -2078,6 +2142,114 @@ function planDiagram(style, layout, nodesData) {
 }
 
 /**
+ * @brief Picks the palette `line-theme` names, or null for box colours.
+ *
+ * `true` and `box` keep wires in their box colour, which is the default.
+ * `custom` reads the hex colours listed in `line-palette`.
+ *
+ * @param {Object} style - Style configuration.
+ * @param {Array} errors - Parse errors, appended to.
+ * @returns {Array|null} Palette, or null when wires take box colours.
+ */
+function lineThemePalette(style, errors) {
+    const name = String(style['line-theme']).trim();
+    if (name === 'true' || name === 'box') return null;
+
+    if (name === 'custom') {
+        const listed = String(style['line-palette'] || '').split(',').map(c => c.trim());
+        const palette = listed.filter(c => OrcaTraces.isHexColour(c));
+        for (const bad of listed.filter(c => c && !OrcaTraces.isHexColour(c))) {
+            errors.push("line-palette entry '" + bad + "' is not a hex colour such as #e6194b.");
+        }
+        if (palette.length > 0) return palette;
+        errors.push('line-theme: custom needs line-palette with at least one hex colour.');
+        return null;
+    }
+
+    if (Themes[name]) return Themes[name];
+    errors.push("line-theme '" + name + "' is not one of box, custom, "
+        + Object.keys(Themes).join(', ') + '.');
+    return null;
+}
+
+/**
+ * @brief Colours every connection by trace for the opt-in `line-theme`.
+ *
+ * Runs after planning, so it reads the merge buses every level chose and
+ * changes no geometry. Members of one bus become one trace.
+ *
+ * @param {Object} style - Style configuration.
+ * @param {Object} placement - { order } from placeLayout(), may be null.
+ * @param {Object} nodesData - Parsed nodes; errors are appended to it.
+ * @returns {Array|null} Colour per connection index, or null for box colours.
+ */
+function planTraceColours(style, placement, nodesData) {
+    const palette = lineThemePalette(style, nodesData.errors);
+    const overrides = {};
+    for (const conn of nodesData.connections) {
+        if (conn.colour) overrides[conn.index] = conn.colour;
+    }
+    if (!palette && Object.keys(overrides).length === 0) return null;
+
+    const links = [];
+    for (const box of (placement && placement.order) || []) {
+        const plans = [box.bundle && box.bundle.plan, box.gutter && box.gutter.plan];
+        for (const plan of plans) {
+            if (!plan) continue;
+            for (const key in plan.buses) {
+                const members = plan.buses[key].members;
+                for (let i = 1; i < members.length; i++) {
+                    links.push([members[0].traceIndex, members[i].traceIndex]);
+                }
+            }
+        }
+    }
+
+    const traces = OrcaTraces.groupTraces(nodesData.connections.length, links);
+    // An override alone colours its own trace and leaves the rest in a
+    // neutral stroke, since there is no box colour to fall back on per trace.
+    const result = OrcaTraces.assignColours(traces, palette || [null], overrides);
+    for (const conflict of result.conflicts) {
+        nodesData.errors.push('Wires sharing one bus asked for ' + conflict.kept + ' and '
+            + conflict.dropped + '. Kept ' + conflict.kept + '.');
+    }
+    return result.colours;
+}
+
+/**
+ * @brief Builds the per-wire colour lookup for one plan.
+ * @param {Object} plan - Result of planSection().
+ * @param {string} fallback - Colour for a wire with no trace colour.
+ * @returns {Function} (netId) -> colour, where netId may be 'bus:<key>'.
+ */
+function wireColourLookup(plan, fallback) {
+    if (!ActiveTraceColours) return () => fallback;
+    const byNet = {};
+    for (const net of plan.nets) {
+        const colour = ActiveTraceColours[net.traceIndex];
+        if (colour) byNet[net.id] = colour;
+    }
+    const traceOf = {};
+    for (const net of plan.nets) traceOf[net.id] = net.traceIndex;
+    const verify = typeof window !== 'undefined' && window.ORCA_VERIFY;
+
+    return netId => {
+        let id = netId;
+        if (typeof netId === 'string' && netId.startsWith('bus:')) {
+            const bus = plan.buses[netId.slice(4)];
+            id = bus ? bus.members[0].id : null;
+        }
+        const colour = byNet[id] || fallback;
+        // The harness asserts every drawn part of one trace has one colour.
+        if (verify && traceOf[id] !== undefined) {
+            if (!window.OrcaCheck.traceColours) window.OrcaCheck.traceColours = [];
+            window.OrcaCheck.traceColours.push([traceOf[id], colour]);
+        }
+        return colour;
+    };
+}
+
+/**
  * @brief Renders the diagram to SVG from its plan.
  *
  * The diagram is sized to fit its content, not a fixed page size, which keeps
@@ -2091,6 +2263,7 @@ function planDiagram(style, layout, nodesData) {
 function renderDiagram(style, layout, nodesData) {
     const plan = planDiagram(style, layout, nodesData);
     LastDiagramPlan = plan;
+    ActiveTraceColours = planTraceColours(style, plan.placement, nodesData);
 
     const margin = plan.margin;
     const themeColors = plan.themeColors;
@@ -2754,22 +2927,24 @@ function renderGutter(box, style, themeColors) {
             (nodeId, key) => continuesInside({ kind: 'box', id: nodeId }, key));
     }
 
+    const colourOf = wireColourLookup(gutter.plan, color);
     let svg = '<g transform="translate(' + box.bounds.x + ',0)">';
 
     for (const line of emitted.polylines) {
         svg += '<path d="' + OrcaRouter.pathData(line.points, cornerRadius) + '"'
-            + ' fill="none" stroke="' + color + '"'
+            + ' fill="none" stroke="' + colourOf(line.netId) + '"'
             + ' stroke-width="' + lineThickness + '"'
             + ' stroke-linecap="round" stroke-linejoin="round"'
             + (line.dashed ? ' stroke-dasharray="5,5"' : '') + '/>';
     }
 
     for (const dot of emitted.junctions) {
-        svg += '<circle cx="' + dot.x + '" cy="' + dot.y + '" r="4" fill="' + color + '"/>';
+        svg += '<circle cx="' + dot.x + '" cy="' + dot.y + '" r="4" fill="'
+            + colourOf('bus:' + dot.busKey) + '"/>';
     }
 
     for (const arrow of emitted.arrows) {
-        svg += renderArrow(arrow.x, arrow.y, arrow.direction, color, 8);
+        svg += renderArrow(arrow.x, arrow.y, arrow.direction, colourOf(arrow.netId), 8);
     }
 
     svg += '</g>';
