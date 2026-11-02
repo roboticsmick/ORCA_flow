@@ -2,6 +2,10 @@
 
 ## 2026-11-01
 
+### Fixed
+
+- The right-most node in a section no longer sits on the section's right border. A section reserved only its content width while placement inset it by 8px each side, so 16px overflowed to the right. TEMP and SONAR on `cross.flow` now have 18px both sides. Every section is 16px wider. The harness now fails on node margins under 8px or unequal left and right margins.
+
 ### Added
 
 - Trace colours, off by default. `line-theme: kelly`, `okabe-ito`, any `theme` name, or `custom` with `line-palette` gives every trace its own colour. A trace is one wire across every box level plus any wires sharing its bus. With `line-theme` left at `true` or `box`, every fixture's SVG is byte-identical to before.

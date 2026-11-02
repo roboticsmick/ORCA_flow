@@ -2406,7 +2406,13 @@ function calculateNodeContentSize(node, nodesData, style, parentName = null) {
                 // is exactly the height the wires will occupy.
                 const bundle = getSectionPlan(nodesData, sectionKey, style, ActiveGapHeight);
                 if (bundle) {
-                    return { width: bundle.contentWidth, height: bundle.totalHeight };
+                    // WHY: placeLayout() insets every segment's content box by
+                    // LAYOUT_PADDING on both sides, but a leaf reserved only
+                    // its content width. Content came out 16px wider than its
+                    // box, sectionOriginX() clamped the centring offset to 0,
+                    // and the whole overflow landed on the right, so the
+                    // right-most node sat on the box edge.
+                    return { width: bundle.contentWidth + padding * 2, height: bundle.totalHeight };
                 }
             }
 
