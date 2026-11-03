@@ -1075,6 +1075,9 @@ let ActiveLevels = null;
 /** Boundary port X per level id and net key, in that level's content space. */
 let BoundaryHints = {};
 
+/** Per level id, a lookup from node or box id to its X in that level's content space. */
+let EndpointHints = {};
+
 /** Most size, place and join rounds the plan phase takes to settle. */
 const MAX_JOIN_PASSES = 4;
 
@@ -1575,9 +1578,12 @@ function continuesInside(end, key) {
  * @param {string|null} levelId - Level box id.
  * @param {Object} ids - Net key to boundary node id, from frameBoundaryRows().
  * @param {Function} accept - Returns true for a piece end id this level holds.
+ * @param {Function} [prefer] - Maps a node or box id to its X in this level's
+ *                              space, or null. A wire carrying on inside a
+ *                              child box aims its port there.
  * @returns {Array} Connections keyed by net key.
  */
-function boundaryConnections(levelId, ids, accept) {
+function boundaryConnections(levelId, ids, accept, prefer) {
     console.assert(ids && typeof accept === 'function', 'boundaryConnections needs ids and a filter');
     if (!ActiveLevels || !levelId) return [];
 
@@ -1598,6 +1604,8 @@ function boundaryConnections(levelId, ids, accept) {
         const to = endId(piece.to, piece.key);
         if (!from || !to) continue;
 
+        const continuesFrom = continuesInside(piece.from, piece.key);
+        const continuesTo = continuesInside(piece.to, piece.key);
         connections.push({
             id: piece.key,
             from: from,
@@ -1605,8 +1613,16 @@ function boundaryConnections(levelId, ids, accept) {
             type: piece.connection.type,
             dashed: !!piece.connection.dashed,
             traceIndex: piece.connection.index,
-            continuesFrom: continuesInside(piece.from, piece.key),
-            continuesTo: continuesInside(piece.to, piece.key)
+            continuesFrom: continuesFrom,
+            continuesTo: continuesTo,
+            // Pieces keep the connection's direction, so the from end of a
+            // piece always leads to the connection's own from endpoint.
+            // Only a node end is looked up. A section name and a node id can
+            // coincide, so a section end keeps the box-centred fan.
+            sourcePreferX: continuesFrom && prefer && piece.connection.fromKind !== 'section'
+                ? prefer(piece.connection.from) : null,
+            targetPreferX: continuesTo && prefer && piece.connection.toKind !== 'section'
+                ? prefer(piece.connection.to) : null
         });
     }
     return connections;
@@ -1753,12 +1769,13 @@ function getGutterPlan(node, childSizes, style) {
     /**
      * @brief Plans the level with its boundary ports at the given Xs.
      * @param {Object} hints - Net key to fixed boundary port X, may be empty.
+     * @param {Function} [prefer] - Real endpoint X lookup, see boundaryConnections().
      * @returns {Object} { plan, framed }, where plan is null with no nets.
      */
-    function planWith(hints) {
+    function planWith(hints, prefer) {
         const framed = frameBoundaryRows(cacheKey, contentRows, contentWidth, hints);
         const connections = boundaryConnections(cacheKey, framed.ids,
-            id => childIndex[id] !== undefined);
+            id => childIndex[id] !== undefined, prefer);
         if (connections.length === 0) return { plan: null, framed: framed };
 
         const plan = OrcaRouter.planSection({
@@ -1770,7 +1787,10 @@ function getGutterPlan(node, childSizes, style) {
         return { plan: plan, framed: framed };
     }
 
-    const planned = planWith((cacheKey && BoundaryHints[cacheKey]) || {});
+    // Last round's endpoint Xs size the level, so the ports its join aims at
+    // them have the tracks they need.
+    const prefer = (cacheKey && EndpointHints[cacheKey]) || undefined;
+    const planned = planWith((cacheKey && BoundaryHints[cacheKey]) || {}, prefer);
     const plan = planned.plan;
     const framed = planned.framed;
     const rowCount = framed.rows.length;
@@ -1817,7 +1837,7 @@ function getGutterPlan(node, childSizes, style) {
         plan: plan,
         // Routes the level again once the level above has fixed its boundary
         // port Xs. The rows keep their shape, so the reserved room applies.
-        replan: hints => planWith(hints).plan
+        replan: (hints, prefer) => planWith(hints, prefer).plan
     };
 
     if (cacheKey) GutterPlanCache[cacheKey] = bundle;
@@ -1925,6 +1945,7 @@ function renderSection(bundle, bounds, edges, style, color) {
             nodeHits: OrcaRouter.findNodeCollisions(emitted.segments, nodeBoxes, 1.0).length
         });
         recordJoinEnds(emitted, plan, offsetX, () => false);
+        recordWires(emitted, bundle.sectionKey, offsetX);
     }
 
     const lineThickness = style['line-thickness'] || 2;
@@ -2096,6 +2117,7 @@ function planDiagram(style, layout, nodesData) {
     // port Xs the previous round's join fixed. The first round uses ports
     // spread along each edge, which is usually close enough to fit at once.
     BoundaryHints = {};
+    EndpointHints = {};
     let contentSize = { width: 400, height: 300 };
     let placement = null;
     let fitted = true;
@@ -2122,6 +2144,7 @@ function planDiagram(style, layout, nodesData) {
         fitted = joined.fits;
         if (joined.fits) break;
         BoundaryHints = joined.hints;
+        EndpointHints = joined.ends;
     }
 
     // The wires still join when the rounds run out, but some level is routed
@@ -2644,6 +2667,28 @@ function sectionOriginX(bundle, bounds) {
 }
 
 /**
+ * @brief Page X of every connection endpoint once the boxes are placed.
+ *
+ * A node sits where its section put it. Only node ends are aimed at, so box
+ * and section ends are left out.
+ *
+ * @param {Object} placement - { root, order } from placeLayout().
+ * @returns {Object} Map from node id to page X.
+ */
+function placedEndpointX(placement) {
+    console.assert(placement && Array.isArray(placement.order), 'placedEndpointX needs a placement');
+    const xs = {};
+    for (const box of placement.order) {
+        if (!box.bundle || !box.bounds) continue;
+        const origin = sectionOriginX(box.bundle, box.bounds);
+        for (const row of box.bundle.sectionLayout.rows) {
+            for (const node of row.nodes) xs[node.id] = origin + node.localX;
+        }
+    }
+    return xs;
+}
+
+/**
  * @brief Routes every level to the boundary port Xs its parent chose.
  *
  * Boxes are visited parents first, which is the order placement records them
@@ -2655,14 +2700,17 @@ function sectionOriginX(bundle, bounds) {
  * @pre placement must come from placeLayout() in this round.
  *
  * @param {Object} placement - { root, order } from placeLayout().
- * @returns {Object} { hints, fits } where hints is the port X per level and
- *                   net, and fits is false if any level outgrew its room.
+ * @returns {Object} { hints, ends, fits } where hints is the port X per level
+ *                   and net, ends the endpoint X lookup per level, and
+ *                   fits is false if any level outgrew its room.
  */
 function joinBoundaries(placement) {
     console.assert(placement && Array.isArray(placement.order), 'joinBoundaries needs a placement');
 
     const hints = {};
     let fits = true;
+    const endpointX = placedEndpointX(placement);
+    const ends = {};
 
     for (const box of placement.order) {
         if (!box.level) continue;
@@ -2676,9 +2724,22 @@ function joinBoundaries(placement) {
         }
 
         if (!box.gutter || !box.gutter.plan) continue;
+
+        // WHY: a port on a child box edge was centred on the box, which has
+        // nothing to do with where the wire goes inside it. A wire to a node
+        // left of a wide box's centre entered right of it and doubled back.
+        // Placement is known now, so aim each such port at its real endpoint.
+        const local = planOriginX(box);
+        const prefer = id => (Number.isFinite(endpointX[id]) ? endpointX[id] - local : null);
+        ends[box.level.id] = prefer;
+        const plan = box.gutter.replan(own, prefer);
+        const planFitted = planFits(plan, box.gutter.gapHeights, Infinity);
         if (box.gutter.hasBoundary) {
-            const plan = box.gutter.replan(own);
-            fits = fits && planFits(plan, box.gutter.gapHeights, Infinity);
+            fits = fits && planFitted;
+            box.gutter = Object.assign({}, box.gutter, { plan: plan });
+        } else if (planFitted) {
+            // A gutter with no edge of its own always fitted the plan it was
+            // sized with, so it only takes the aimed plan when that fits too.
             box.gutter = Object.assign({}, box.gutter, { plan: plan });
         }
 
@@ -2687,18 +2748,17 @@ function joinBoundaries(placement) {
         for (const child of box.children) {
             if (child.level) childById[child.level.id] = child;
         }
-        const origin = planOriginX(box);
         for (const net of box.gutter.plan.nets) {
             for (const [nodeId, x] of [[net.from, net.sourceX], [net.to, net.targetX]]) {
                 const child = childById[nodeId];
                 if (!child || !child.bounds) continue;
                 if (!hints[nodeId]) hints[nodeId] = {};
-                hints[nodeId][net.id] = origin + x - planOriginX(child);
+                hints[nodeId][net.id] = local + x - planOriginX(child);
             }
         }
     }
 
-    return { hints: hints, fits: fits };
+    return { hints: hints, ends: ends, fits: fits };
 }
 
 /**
@@ -2776,6 +2836,32 @@ function recordJoinEnds(emitted, plan, originX, continues) {
             if (node.boundary) window.OrcaCheck.joinEnds.boundary.push(end);
             else if (continues(node.id, net.id)) window.OrcaCheck.joinEnds.box.push(end);
         }
+    }
+}
+
+/**
+ * @brief Records a level's wire segments in page X, for the length checks.
+ *
+ * A section's own nets are named per section, so their keys are prefixed
+ * with the level. A piece of a wire between boxes keeps its global key, so
+ * every level's share of one wire collects under one name.
+ *
+ * @param {Object} emitted - Emitted, stretched geometry in local X.
+ * @param {string} level - Section key or box name.
+ * @param {number} originX - Page X of local X zero.
+ * @returns {void}
+ */
+function recordWires(emitted, level, originX) {
+    if (typeof window === 'undefined' || !window.ORCA_VERIFY || !window.OrcaCheck) return;
+    console.assert(typeof originX === 'number', 'recordWires needs a numeric origin');
+    if (!window.OrcaCheck.wires) window.OrcaCheck.wires = [];
+
+    for (const seg of emitted.segments) {
+        const key = seg.netId.charAt(0) === 'n' ? seg.netId : level + ':' + seg.netId;
+        window.OrcaCheck.wires.push({
+            key: key, orientation: seg.orientation,
+            x1: originX + seg.x1, y1: seg.y1, x2: originX + seg.x2, y2: seg.y2
+        });
     }
 }
 
@@ -2931,6 +3017,7 @@ function renderGutter(box, style, themeColors) {
         // routes a piece of the same net.
         recordJoinEnds(emitted, gutter.plan, box.bounds.x,
             (nodeId, key) => continuesInside({ kind: 'box', id: nodeId }, key));
+        recordWires(emitted, box.name || 'anon', box.bounds.x);
     }
 
     const colourOf = wireColourLookup(gutter.plan, color);

@@ -81,6 +81,9 @@
     /** Two X values closer than this are treated as the same position. */
     const EPSILON = 0.5;
 
+    /** Most runs in one gap that get the vertical constraint ordering. */
+    const MAX_CONSTRAINED_RUNS = 256;
+
     // =========================================================================
     // 2. SMALL HELPERS
     // =========================================================================
@@ -301,7 +304,9 @@
      * has to spread again immediately below.
      *
      * @param {Object} node - Node carrying centreX and width.
-     * @param {Array} attachments - Entries as { key, idealX }, one per port.
+     * @param {Array} attachments - Entries as { key, idealX, preferX? }, one per
+     *                              port. Any preferX switches the edge to
+     *                              placePreferredPorts().
      * @param {Object} geometry - Geometry settings.
      * @returns {Object} Map from attachment key to port X in pixels.
      */
@@ -317,6 +322,12 @@
 
         const usable = Math.max(0, node.width - 2 * geometry.portInset);
         const even = count > 1 ? usable / (count - 1) : 0;
+
+        if (attachments.some(a => Number.isFinite(a.preferX))) {
+            const preferred = placePreferredPorts(node, ordered, geometry, usable);
+            if (preferred) return preferred;
+        }
+
         const pitch = count > 1
             ? Math.max(Math.min(even, geometry.portPitchMax), Math.min(geometry.portPitch, even))
             : 0;
@@ -327,6 +338,50 @@
             result[attachment.key] = left + index * pitch;
         });
 
+        return result;
+    }
+
+    /**
+     * @brief Places ports on a child box edge as close to their wires as fits.
+     *
+     * A wire entering a box carries on to a node inside it, so its port sits
+     * over that node rather than in a fan around the box centre. A port with
+     * no preference, a wire ending on the box itself, aims at its far end.
+     * Ports keep their order and the minimum pitch, and stay inside the inset.
+     *
+     * @param {Object} node - Box node carrying centreX and width.
+     * @param {Array} ordered - Attachments in any order; they are re-sorted by aim.
+     * @param {Object} geometry - Geometry settings.
+     * @param {number} usable - Edge width less the inset on both sides.
+     * @returns {Object|null} Map from key to port X, or null when the edge is
+     *                        too short to hold every port at the minimum pitch.
+     */
+    function placePreferredPorts(node, ordered, geometry, usable) {
+        const count = ordered.length;
+        const pitch = geometry.portPitch;
+        assert(pitch > 0, 'portPitch must be positive');
+        if (count > 1 && usable < pitch * (count - 1) - EPSILON) return null;
+
+        const low = node.centreX - usable / 2;
+        const high = node.centreX + usable / 2;
+        const aim = a => clamp(Number.isFinite(a.preferX) ? a.preferX : a.idealX, low, high);
+
+        // Order by where each port wants to be, so no two wires swap sides.
+        const byAim = ordered.slice().sort((a, b) => {
+            if (Math.abs(aim(a) - aim(b)) > EPSILON) return aim(a) - aim(b);
+            return String(a.key) < String(b.key) ? -1 : 1;
+        });
+
+        // Push right to make the pitch, then back left from the far end. The
+        // length check above means the left pass never runs past low.
+        const xs = byAim.map(aim);
+        for (let i = 1; i < count; i++) xs[i] = Math.max(xs[i], xs[i - 1] + pitch);
+        xs[count - 1] = Math.min(xs[count - 1], high);
+        for (let i = count - 2; i >= 0; i--) xs[i] = Math.min(xs[i], xs[i + 1] - pitch);
+        assert(xs[0] >= low - EPSILON, 'preferred ports ran past the left inset');
+
+        const result = {};
+        byAim.forEach((attachment, i) => { result[attachment.key] = xs[i]; });
         return result;
     }
 
@@ -448,48 +503,202 @@
     // =========================================================================
 
     /**
-     * @brief Assigns horizontal tracks in one gap using the left-edge algorithm.
+     * @brief Assigns horizontal tracks in one gap with the plain left-edge algorithm.
      *
      * Runs are sorted by left endpoint and each takes the lowest track index
-     * whose occupied spans do not conflict with it. This is the classic channel
-     * routing allocation and uses the minimum number of tracks for the given
-     * ordering, with the guarantee that two runs on one track never overlap.
+     * whose occupied spans do not conflict with it. Taken in left-edge order,
+     * every run already placed that conflicts with the next one contains its
+     * left end, so they form a clique and the count is the minimum possible.
+     *
+     * @param {Array} runs - Entries as { low, high, ... }.
+     * @param {number} margin - Required separation between runs on one track.
+     * @returns {Array} Track index per run, in the order given.
+     */
+    function leftEdgeTracks(runs, margin) {
+        assert(Array.isArray(runs), 'runs must be an array');
+        assert(margin >= 0, 'margin must not be negative');
+        const order = runs.map((run, i) => i).sort((a, b) => {
+            if (Math.abs(runs[a].low - runs[b].low) > EPSILON) return runs[a].low - runs[b].low;
+            return runs[b].high - runs[a].high;  // Longer runs first on a tie.
+        });
+
+        const tracks = [];  // tracks[t] holds the runs already placed on track t.
+        const result = new Array(runs.length);
+
+        for (const i of order) {
+            const run = runs[i];
+            let t = 0;
+            while (t < tracks.length && tracks[t].some(other =>
+                intervalsConflict(run.low, run.high, other.low, other.high, margin))) t++;
+            if (t === tracks.length) tracks.push([]);
+            tracks[t].push(run);
+            result[i] = t;
+        }
+        return result;
+    }
+
+    /**
+     * @brief Finds, per run, the runs that must sit above it.
+     *
+     * A run whose wire leaves upward at an X inside another run's span crosses
+     * that run unless it sits above it, and one leaving downward crosses it
+     * unless it sits below. These are the vertical constraints.
+     *
+     * @param {Array} runs - Runs carrying ends as [{ x, up }].
+     * @returns {Array} Per run, the indices of runs that must sit above it.
+     */
+    function verticalConstraints(runs) {
+        assert(Array.isArray(runs), 'runs must be an array');
+        const above = runs.map(() => []);
+        const inside = (x, run) => x > run.low + EPSILON && x < run.high - EPSILON;
+
+        for (let a = 0; a < runs.length; a++) {
+            // A zero-width run is a wire passing straight through the gap. It
+            // crosses whatever spans it on any track, so it constrains nothing.
+            if (runs[a].high - runs[a].low <= EPSILON) continue;
+            for (let b = 0; b < runs.length; b++) {
+                if (a === b) continue;
+                for (const end of runs[a].ends || []) {
+                    if (!inside(end.x, runs[b])) continue;
+                    if (end.up && above[b].indexOf(a) === -1) above[b].push(a);
+                    if (!end.up && above[a].indexOf(b) === -1) above[a].push(b);
+                }
+            }
+        }
+        return above;
+    }
+
+    /**
+     * @brief Fills tracks top down, placing a run only once those above it are.
+     *
+     * This is the constrained left-edge algorithm. With defer set, a run whose
+     * every end leaves downward waits until all other runs are placed, so it
+     * lands on the tracks nearest the row below. A zero-width run waits too.
+     *
+     * The loop is bounded by limit tracks and places at least one run per
+     * track, so it always ends.
+     *
+     * @param {Array} runs - Runs carrying low, high and ends.
+     * @param {Array} above - Result of verticalConstraints().
+     * @param {number} margin - Required separation between runs on one track.
+     * @param {number} limit - Most tracks allowed.
+     * @param {boolean} defer - Hold back runs that only leave downward.
+     * @returns {Object|null} { tracks, relaxed } with a track index per run and
+     *                        the number of runs placed against a constraint,
+     *                        or null when the runs need more than limit tracks.
+     */
+    function constrainedTracks(runs, above, margin, limit, defer) {
+        const order = runs.map((run, i) => i).sort((a, b) => {
+            if (Math.abs(runs[a].low - runs[b].low) > EPSILON) return runs[a].low - runs[b].low;
+            return runs[b].high - runs[a].high;
+        });
+        // Runs leaving only downward, and pass-through runs, which fit on any
+        // track, go last so they never take a track another run needs.
+        const downOnly = runs.map(run => run.high - run.low <= EPSILON
+            || ((run.ends || []).length > 0 && run.ends.every(e => !e.up)));
+        assert(above.length === runs.length, 'one constraint list per run');
+        assert(limit >= 1, 'a gap with runs needs at least one track');
+        const result = new Array(runs.length).fill(-1);
+        let left = runs.length;
+        let relaxed = 0;
+        let othersLeft = downOnly.filter(d => !d).length;
+
+        const waiting = i => above[i].filter(j => result[j] === -1).length;
+
+        for (let t = 0; t < limit && left > 0; t++) {
+            const onTrack = [];
+            const place = i => {
+                onTrack.push(runs[i]);
+                result[i] = t;
+                left--;
+                if (!downOnly[i]) othersLeft--;
+            };
+
+            // Interleaved runs can each need to sit above the other. Then no
+            // run is free, so the one waiting on fewest goes first and takes
+            // the crossing, rather than the whole gap losing its order.
+            const free = order.filter(i => result[i] === -1 && waiting(i) === 0
+                && !(defer && downOnly[i] && othersLeft > 0));
+            if (free.length === 0) {
+                const pending = order.filter(i => result[i] === -1
+                    && !(defer && downOnly[i] && othersLeft > 0));
+                if (pending.length === 0) return null;
+                let best = pending[0];
+                for (const i of pending) if (waiting(i) < waiting(best)) best = i;
+                place(best);
+                relaxed++;
+            }
+
+            // Held-back runs get a second sweep, so one whose last blocker
+            // lands on this track can still join it.
+            for (const late of (defer ? [false, true] : [false])) {
+                for (const i of order) {
+                    if (result[i] !== -1 || (defer && downOnly[i] !== late)) continue;
+                    if (defer && downOnly[i] && othersLeft > 0) continue;
+                    // Every run that must sit above this one is on a higher track.
+                    if (above[i].some(j => result[j] === -1 || result[j] === t)) continue;
+                    const run = runs[i];
+                    if (onTrack.some(other =>
+                        intervalsConflict(run.low, run.high, other.low, other.high, margin))) continue;
+                    place(i);
+                }
+            }
+        }
+        return left === 0 ? { tracks: result, relaxed: relaxed } : null;
+    }
+
+    /**
+     * @brief Assigns horizontal tracks in one gap.
+     *
+     * The track count is always the left-edge minimum, so no gap grows. Within
+     * it, runs are ordered so a wire leaving upward sits above any run it would
+     * otherwise cut through, and one leaving downward sits below, which puts a
+     * wire with both ends above the gap on the tracks nearest them. When the
+     * constraints cannot be met in that many tracks, the plain left-edge order
+     * is kept, which still guarantees that two runs on one track never overlap.
      *
      * Runs belonging to the same merge bus arrive here already combined into a
      * single run, so a bus occupies exactly one track.
      *
-     * @param {Array} runs - Entries as { low, high, ... }; mutated with .track.
+     * @param {Array} runs - Entries as { low, high, ends, ... }; mutated with .track.
      * @param {number} margin - Required separation between runs on one track.
      * @returns {number} Number of tracks used.
      */
     function assignHorizontalTracks(runs, margin) {
         if (runs.length === 0) return 0;
 
-        const ordered = runs.slice().sort((a, b) => {
-            if (Math.abs(a.low - b.low) > EPSILON) return a.low - b.low;
-            return b.high - a.high;  // Longer runs first on a tie.
-        });
+        const plain = leftEdgeTracks(runs, margin);
+        const limit = plain.reduce((a, b) => Math.max(a, b), 0) + 1;
 
-        const tracks = [];  // tracks[i] holds the runs already placed on track i.
-
-        for (const run of ordered) {
-            let placed = false;
-            for (let t = 0; t < tracks.length && !placed; t++) {
-                const conflict = tracks[t].some(other =>
-                    intervalsConflict(run.low, run.high, other.low, other.high, margin));
-                if (!conflict) {
-                    tracks[t].push(run);
-                    run.track = t;
-                    placed = true;
-                }
-            }
-            if (!placed) {
-                run.track = tracks.length;
-                tracks.push([run]);
-            }
+        // The constraint fill is cubic in the runs of one gap, so a gap past
+        // this size keeps the plain order rather than stall the page.
+        if (runs.length > MAX_CONSTRAINED_RUNS) {
+            runs.forEach((run, i) => { run.track = plain[i]; });
+            return limit;
         }
 
-        return tracks.length;
+        // WHY: the left-edge order looks only at where a run starts, never at
+        // which side of the gap its wire leaves by. A wire between two boxes
+        // above the root gutter took its bottom track and crossed every wire
+        // going down to the box below it.
+        const above = verticalConstraints(runs);
+        // Holding back down-only runs can itself force a relaxation, so both
+        // fills run and the one breaking fewer constraints wins.
+        const deferred = constrainedTracks(runs, above, margin, limit, true);
+        const eager = constrainedTracks(runs, above, margin, limit, false);
+        let chosen = plain;
+        if (deferred && (!eager || deferred.relaxed <= eager.relaxed)) chosen = deferred.tracks;
+        else if (eager) chosen = eager.tracks;
+
+        assert(chosen.every(t => t >= 0 && t < limit), 'a run fell outside the track limit');
+        for (let a = 0; a < runs.length; a++) {
+            for (let b = a + 1; b < runs.length; b++) {
+                assert(chosen[a] !== chosen[b] || !intervalsConflict(runs[a].low, runs[a].high,
+                    runs[b].low, runs[b].high, margin), 'two runs on one track overlap');
+            }
+        }
+        runs.forEach((run, i) => { run.track = chosen[i]; });
+        return limit;
     }
 
     // =========================================================================
@@ -586,6 +795,10 @@
                 dashed: !!conn.dashed,
                 continuesFrom: !!conn.continuesFrom,
                 continuesTo: !!conn.continuesTo,
+                // Page X of the real endpoint inside a child box, in this
+                // section's space, when the caller knows it.
+                sourcePreferX: Number.isFinite(conn.sourcePreferX) ? conn.sourcePreferX : null,
+                targetPreferX: Number.isFinite(conn.targetPreferX) ? conn.targetPreferX : null,
                 // Caller's own wire identity, carried through untouched for colouring.
                 traceIndex: conn.traceIndex,
                 source: source.node,
@@ -641,11 +854,18 @@
          * @param {string} edge - Either "top" or "bottom".
          * @param {string} key - Identity of the attachment.
          * @param {number} idealX - X the wire heads toward.
+         * @param {number|null} preferX - X the port should sit at, or null.
          * @returns {void}
          */
-        function addAttachment(nodeId, edge, key, idealX) {
+        function addAttachment(nodeId, edge, key, idealX, preferX) {
             const edgeKey = nodeId + '|' + edge;
             if (!edgeAttachments[edgeKey]) edgeAttachments[edgeKey] = [];
+            if (preferX !== null) {
+                // A wire carrying on inside a child box never joins a bus, so
+                // its attachment is always new.
+                edgeAttachments[edgeKey].push({ key: key, idealX: idealX, preferX: preferX, count: 1 });
+                return;
+            }
             const existing = edgeAttachments[edgeKey].find(a => a.key === key);
             if (existing) {
                 // A shared bus port sits at the mean of its members' approaches.
@@ -657,9 +877,9 @@
         }
 
         for (const net of nets) {
-            addAttachment(net.from, net.sourceEdge, 'out:' + net.id, net.target.centreX);
+            addAttachment(net.from, net.sourceEdge, 'out:' + net.id, net.target.centreX, net.sourcePreferX);
             const inKey = net.busKey ? 'bus:' + net.busKey : 'in:' + net.id;
-            addAttachment(net.to, net.targetEdge, inKey, net.source.centreX);
+            addAttachment(net.to, net.targetEdge, inKey, net.source.centreX, net.targetPreferX);
         }
 
         const portX = {};  // "nodeId|edge|key" -> pixel X
@@ -901,6 +1121,10 @@
 
             assert(xs.length === net.gaps.length + 1, 'net ' + net.id + ' path length mismatch');
 
+            // The row each path point sits on. A point on the row above a
+            // gap leaves the run upward, one on the row below leaves downward.
+            const pointRows = [net.sourceRow].concat(net.crossedRows, [net.targetRow]);
+
             net.gaps.forEach((gapIdx, i) => {
                 const startX = xs[i];
                 const endX = xs[i + 1];
@@ -911,6 +1135,10 @@
                     endX: endX,
                     low: Math.min(startX, endX),
                     high: Math.max(startX, endX),
+                    ends: [
+                        { x: startX, up: pointRows[i] <= gapIdx },
+                        { x: endX, up: pointRows[i + 1] <= gapIdx }
+                    ],
                     track: 0
                 };
                 net.runs.push(run);
@@ -946,6 +1174,7 @@
                 high: high,
                 isBus: true,
                 members: sameGap,
+                ends: [].concat.apply([], sameGap.map(r => r.ends)),
                 dropX: bus.members[0].targetX,
                 track: 0
             };

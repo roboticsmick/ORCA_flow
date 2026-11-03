@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-03
+
+### Fixed
+
+- Wires between boxes take shorter routes. A wire with both ends above a gap now takes the tracks nearest them instead of crossing every wire going down. Track order in each gap follows a vertical constraint graph in `assignHorizontalTracks()` in `js/router.js`, with the same track count as before, so no gap grows.
+- A wire entering a box now crosses its edge over the node it is heading to, instead of at the box centre followed by a double back. `joinBoundaries()` in `js/flowschem.js` aims each box edge port at the real endpoint once placement is known, and the next sizing round reserves room for it.
+- On `colours.flow` with `sensors:Teensy <> rov_sensors:Teensy` added, wire crossings drop from 16 to 5 and backtrack from 544px to 181px. On `cross.flow`, crossings drop from 9 to 4.
+
+### Added
+
+- The harness reports wire crossings and backtrack per fixture, for comparison against a baseline. Neither fails a render.
+
 ## 2026-11-01
 
 ### Fixed
