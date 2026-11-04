@@ -3,28 +3,29 @@
 Write a system diagram as text and get a schematic with clean, non-overlapping orthogonal wires.
 
 <img src="assets/orca_flow_demo.png" width="600" alt="ORCA Flow demo">
-<img src="assets/flowschem-diagram.png" width="600" alt="Diagram rendered from test/fixtures/cross.flow">
+<img src="assets/flowschem-diagram.png" width="600" alt="Diagram rendered from a .flow file">
 
 ## Run
 
+From the folder holding `index.html`:
+
 ```sh
-cd ORCA_flow
 python3 -m http.server 8000
 ```
 
 Open `http://localhost:8000`, fill in the three panes on the left, then press **Generate Preview** or `Ctrl+Enter`.
 
 | Control | What it does |
-|---|---|
-| **Generate Preview**, `Ctrl+Enter` | Draws the diagram. |
+| --- | --- |
+| **Generate Preview**, `Ctrl+Enter` | Draws the diagram. Unresolved names are listed in a popup. |
 | **Export PNG** | Saves the diagram as a PNG. |
 | **Export .flow** | Saves the three panes as one `.flow` file. |
 | **Load .flow** | Opens a `.flow` file. |
 | `Ctrl+Wheel`, zoom buttons | Zoom the preview. |
 
-## A .flow file
+## Example
 
-```
+```text
 @style
 theme: engineering
 
@@ -56,53 +57,40 @@ Xbee <> Ground Station
 USV <> ground
 ```
 
-## Layout
+## Syntax
 
-| Pattern | Meaning |
-|---|---|
-| `[a][b]` | `a` and `b` side by side. |
-| `[a]/[b]` | `a` above `b`. |
-| `[Name[a][b]]` | A box called `Name` holding `a` and `b`. |
-
-## Nodes
-
-- A header `section-row`, such as `sensors-1`, starts a row inside that section.
-- The node on the left of a line sits on that row.
-- Every node needs a row. List each target by name under a later row header, or it is not drawn.
-- `Name/hint` adds a smaller second line to a node. It can go on either mention.
-- A line with no symbol places a node with no new links.
-- Commas give one node several targets: `Teensy > GPS, IMU`.
-- Lines starting with `#` are comments.
-
-| Symbol | Wire |
-|---|---|
-| `>` | Arrow to the target. |
-| `<` | Arrow from the target. |
-| `<>` | Arrows both ways. |
-| `->`, `<-`, `<->` | The same, dashed. |
-
-- A trace is one wire across every box it crosses, plus any wires it shares a bus with. A trace has one colour.
-- Write `{#hex}` after a target to colour that wire's trace: `ESC Array > T1, T2 {#e6194b}`. Only `#rgb` and `#rrggbb` are accepted.
-
-## Linking across sections
+| Write | Where | What it does |
+| --- | --- | --- |
+| `[a][b]` | `@layout` | Puts sections `a` and `b` side by side. |
+| `[a]/[b]` | `@layout` | Puts `a` above `b`. |
+| `[Name[a][b]]` | `@layout` | Draws a box called `Name` around `a` and `b`. |
+| `sensors-1` | `@nodes` | Starts row 1 of section `sensors`. Lines below it go on that row. |
+| `Teensy` | `@nodes` | Places a node on the current row with no new links. Every node needs a row, so list each target under a later row. |
+| `Name/hint` | `@nodes` | Adds a smaller second line to a node. Works on either mention. |
+| `A > B` | `@nodes` | Wire with an arrow from `A` to `B`. |
+| `A < B` | `@nodes` | Wire with an arrow from `B` to `A`. |
+| `A <> B` | `@nodes` | Wire with arrows both ways. |
+| `->`, `<-`, `<->` | `@nodes` | The same three wires, dashed. |
+| `A > B, C` | `@nodes` | Links one node to several targets. |
+| `section:Name` | `@nodes` | Reaches a node in another section, for example `top:Filter > bottom:Logger`. Needed when a name exists in more than one section. |
+| `USV <> ground` | `@nodes` | Links two boxes or sections by name. |
+| `links-1` | `@nodes` | A section the layout never draws, used to hold cross-section links. |
+| `B {#e6194b}` | `@nodes` | Colours that wire's whole trace. Goes after a target. Accepts `#rgb` and `#rrggbb` only. |
+| `# text` | any pane | A comment. |
 
 - A directional line (`>`, `<`, `->`, `<-`) creates and links nodes inside its own section only.
-- A two-way line (`<>`, `<->`) links nodes that already exist, in any section. It creates nothing.
-- Write `section:Name` to reach a node in another section with any symbol, for example `top:Filter > bottom:Logger`.
-- Use the qualified form when a name exists in more than one section. A name that matches several sections is reported, not guessed.
-- A section or box name links the box itself: `USV <> ground`.
-- Links can live in a section the layout never draws, such as `links-1`.
-- Unresolved names are listed in a popup after **Generate Preview**.
+- A two-way line (`<>`, `<->`) links nodes that already exist, in any section, and creates nothing.
+- A trace is one wire across every box it crosses, plus any wires sharing its bus. A trace has one colour.
 
 ## Settings
 
-Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px`; only the number is used.
+Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px`, and only the number is used.
 
 | Setting | Range | Default | What it does |
-|---|---|---|---|
-| `theme` | `default`, `monochrome`, `engineering`, `warm`, `cool`, `high-contrast` | `engineering` | Colours given to the boxes in order. |
-| `line-theme` | `box`, `kelly`, `okabe-ito`, `custom`, or any `theme` name | `box` | Wire colours. `box` draws each wire in its box colour. Any other value gives every trace its own colour from that palette. |
-| `line-palette` | comma-separated hex colours | none | The palette `line-theme: custom` uses, for example `#e6194b, #3cb44b, #4363d8`. |
+| --- | --- | --- | --- |
+| `theme` | `default`, `monochrome`, `engineering`, `warm`, `cool`, `high-contrast`, `kelly`, `okabe-ito` | `engineering` | Colours given to the boxes in order. |
+| `line-theme` | `box`, `custom`, or any `theme` name | `box` | Wire colours. `box` draws each wire in its box colour. Any other value gives every trace its own colour from that palette. |
+| `line-palette` | comma-separated hex colours | none | The palette for `line-theme: custom`, for example `#e6194b, #3cb44b, #4363d8`. |
 | `font` | any Google Font | `Roboto Mono` | Node and box label font. |
 | `font-weight` | 100 to 900 | `500` | Node and box label weight. |
 | `font-size` | any number | `14` | Node label size in px. Box labels are 2px larger. |
@@ -120,15 +108,3 @@ Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px
 | `line-spacing` | any number | `15` | Space between parallel wires in px. |
 | `corner-radius` | any number | `4` | Wire corner radius in px. |
 | `page-margin` | 1, 2 or 4 numbers | `10 10 10 10` | Space around the diagram in mm, top right bottom left. |
-
-## Tests
-
-Run from the repo root. The screenshot check needs Chrome and ImageMagick.
-
-```sh
-node test/router.test.js
-node test/levels.test.js
-node test/screenshot.js cross /tmp/orca-shots
-```
-
-Fixtures are in `test/fixtures/`.
