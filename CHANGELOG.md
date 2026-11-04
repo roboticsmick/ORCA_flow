@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-04
+
+### Changed
+
+- Ports on a drawn box edge form one evenly spaced group, in the order of the wires they carry. The group sits where the wires continuing inside the box pull it, so a wire ending on the box no longer gets flung to the corner. On `interstack.flow` both USV and ROV bottom edges now have three evenly spaced ports.
+- Ports in an even group are pinned, so the straightening pass no longer slides one out of line.
+- An unnamed layout wrapper box is never drawn, so its edge does not group ports. Each wire crosses it where it leaves the box inside, found in a children-first pass in `joinBoundaries()`, so no wire jogs inside a wrapper.
+
 ## 2026-11-03
 
 ### Fixed

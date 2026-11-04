@@ -1578,9 +1578,9 @@ function continuesInside(end, key) {
  * @param {string|null} levelId - Level box id.
  * @param {Object} ids - Net key to boundary node id, from frameBoundaryRows().
  * @param {Function} accept - Returns true for a piece end id this level holds.
- * @param {Function} [prefer] - Maps a node or box id to its X in this level's
- *                              space, or null. A wire carrying on inside a
- *                              child box aims its port there.
+ * @param {Function} [prefer] - (boxId, nodeId, key) to the X in this level's
+ *                              space a wire carrying on inside child box boxId
+ *                              aims its port at, or null.
  * @returns {Array} Connections keyed by net key.
  */
 function boundaryConnections(levelId, ids, accept, prefer) {
@@ -1619,10 +1619,12 @@ function boundaryConnections(levelId, ids, accept, prefer) {
             // piece always leads to the connection's own from endpoint.
             // Only a node end is looked up. A section name and a node id can
             // coincide, so a section end keeps the box-centred fan.
-            sourcePreferX: continuesFrom && prefer && piece.connection.fromKind !== 'section'
-                ? prefer(piece.connection.from) : null,
-            targetPreferX: continuesTo && prefer && piece.connection.toKind !== 'section'
-                ? prefer(piece.connection.to) : null
+            sourcePreferX: continuesFrom && prefer
+                ? prefer(piece.from.id, piece.connection.fromKind === 'section' ? null : piece.connection.from, piece.key)
+                : null,
+            targetPreferX: continuesTo && prefer
+                ? prefer(piece.to.id, piece.connection.toKind === 'section' ? null : piece.connection.to, piece.key)
+                : null
         });
     }
     return connections;
@@ -1695,6 +1697,9 @@ function getGutterPlan(node, childSizes, style) {
     const direction = node.direction || 'row';
     const geometry = gutterGeometry(style);
     const childIds = childSizes.map((_, i) => levelBox ? levelBox.children[i].id : 'child' + i);
+    // An unnamed box is a layout wrapper that is never drawn, so wires pass
+    // through its edge rather than fanning out along it.
+    const passThrough = childSizes.map((_, i) => !!levelBox && !levelBox.children[i].name);
     const childIndex = {};
     childIds.forEach((id, i) => { childIndex[id] = i; });
 
@@ -1745,7 +1750,8 @@ function getGutterPlan(node, childSizes, style) {
         childSizes.forEach((size, i) => {
             childOffsets.push(cursor);
             childWidths.push(size.width);
-            boxes.push({ id: childIds[i], centreX: cursor + size.width / 2, width: size.width });
+            boxes.push({ id: childIds[i], centreX: cursor + size.width / 2, width: size.width,
+                passThrough: passThrough[i] });
             cursor += size.width + LAYOUT_GUTTER;
         });
 
@@ -1760,7 +1766,8 @@ function getGutterPlan(node, childSizes, style) {
             childWidths.push(columnWidth);
             contentRowHeights.push(size.height);
             return {
-                nodes: [{ id: childIds[i], centreX: sideChannel + columnWidth / 2, width: columnWidth }]
+                nodes: [{ id: childIds[i], centreX: sideChannel + columnWidth / 2, width: columnWidth,
+                    passThrough: passThrough[i] }]
             };
         });
         contentWidth = columnWidth + sideChannel * 2;
@@ -2712,6 +2719,37 @@ function joinBoundaries(placement) {
     const endpointX = placedEndpointX(placement);
     const ends = {};
 
+    // Inside a wrapper box, page X of each wire's port on the box it holds.
+    // Wrappers go children first, so a wrapper inside a wrapper is ready.
+    const throughX = {};
+
+    /**
+     * @brief Builds the port aim lookup for one level.
+     * @param {number} local - Page X of the level's local zero.
+     * @returns {Function} (boxId, nodeId, key) to local X, or null.
+     */
+    function preferAt(local) {
+        return (boxId, nodeId, key) => {
+            // WHY: a wrapper is never drawn, so a wire crossing its edge must
+            // land where it leaves the box inside, or it jogs in the wrapper.
+            const through = throughX[boxId] && throughX[boxId][key];
+            if (Number.isFinite(through)) return through - local;
+            return nodeId !== null && Number.isFinite(endpointX[nodeId]) ? endpointX[nodeId] - local : null;
+        };
+    }
+
+    for (const box of placement.order.slice().reverse()) {
+        if (!box.level || box.name || !box.gutter || !box.gutter.plan) continue;
+        const local = planOriginX(box);
+        const plan = box.gutter.replan(hints[box.level.id] || {}, preferAt(local));
+        const inner = {};
+        for (const net of plan.nets) {
+            if (!net.source.boundary) inner[net.id] = local + net.sourceX;
+            if (!net.target.boundary) inner[net.id] = local + net.targetX;
+        }
+        throughX[box.level.id] = inner;
+    }
+
     for (const box of placement.order) {
         if (!box.level) continue;
         const own = hints[box.level.id] || {};
@@ -2730,7 +2768,7 @@ function joinBoundaries(placement) {
         // left of a wide box's centre entered right of it and doubled back.
         // Placement is known now, so aim each such port at its real endpoint.
         const local = planOriginX(box);
-        const prefer = id => (Number.isFinite(endpointX[id]) ? endpointX[id] - local : null);
+        const prefer = preferAt(local);
         ends[box.level.id] = prefer;
         const plan = box.gutter.replan(own, prefer);
         const planFitted = planFits(plan, box.gutter.gapHeights, Infinity);

@@ -323,14 +323,16 @@
         const usable = Math.max(0, node.width - 2 * geometry.portInset);
         const even = count > 1 ? usable / (count - 1) : 0;
 
-        if (attachments.some(a => Number.isFinite(a.preferX))) {
-            const preferred = placePreferredPorts(node, ordered, geometry, usable);
-            if (preferred) return preferred;
-        }
-
         const pitch = count > 1
             ? Math.max(Math.min(even, geometry.portPitchMax), Math.min(geometry.portPitch, even))
             : 0;
+
+        if (attachments.some(a => Number.isFinite(a.preferX))) {
+            const preferred = node.passThrough
+                ? placeThroughPorts(node, ordered, geometry.portPitch, usable)
+                : placePreferredPorts(node, ordered, pitch, usable);
+            if (preferred) return preferred;
+        }
         const span = pitch * (count - 1);
         const left = node.centreX - span / 2;
 
@@ -342,25 +344,28 @@
     }
 
     /**
-     * @brief Places ports on a child box edge as close to their wires as fits.
+     * @brief Places ports on a child box edge as one even group near its wires.
      *
-     * A wire entering a box carries on to a node inside it, so its port sits
-     * over that node rather than in a fan around the box centre. A port with
-     * no preference, a wire ending on the box itself, aims at its far end.
-     * Ports keep their order and the minimum pitch, and stay inside the inset.
+     * A wire entering a box carries on to a node inside it, so the edge's ports
+     * sit near those nodes rather than around the box centre. A port with no
+     * preference, a wire ending on the box itself, aims at its far end. The
+     * ports keep the order of their aims and the same even pitch a node edge
+     * fans out at, and the group sits where its continuing wires pull it,
+     * inside the inset.
      *
      * @param {Object} node - Box node carrying centreX and width.
      * @param {Array} ordered - Attachments in any order; they are re-sorted by aim.
-     * @param {Object} geometry - Geometry settings.
+     * @param {number} pitch - Spacing between neighbouring ports.
      * @param {number} usable - Edge width less the inset on both sides.
-     * @returns {Object|null} Map from key to port X, or null when the edge is
-     *                        too short to hold every port at the minimum pitch.
+     * @returns {Object|null} Map from key to port X, or null when the group is
+     *                        wider than the edge.
      */
-    function placePreferredPorts(node, ordered, geometry, usable) {
+    function placePreferredPorts(node, ordered, pitch, usable) {
         const count = ordered.length;
-        const pitch = geometry.portPitch;
-        assert(pitch > 0, 'portPitch must be positive');
-        if (count > 1 && usable < pitch * (count - 1) - EPSILON) return null;
+        assert(count > 0, 'an edge with no ports needs no placing');
+        assert(count === 1 || pitch > 0, 'several ports need a positive pitch');
+        const span = pitch * (count - 1);
+        if (span > usable + EPSILON) return null;
 
         const low = node.centreX - usable / 2;
         const high = node.centreX + usable / 2;
@@ -372,13 +377,60 @@
             return String(a.key) < String(b.key) ? -1 : 1;
         });
 
+        // WHY: each port used to sit at its own aim, pushed apart only to the
+        // minimum pitch. A wire ending on the box aimed at its far end and was
+        // flung to the corner, leaving uneven gaps. One even group keeps the
+        // spacing uniform. Only wires carrying on inside the box place it,
+        // each pulling the group toward its node, because the aim of a wire
+        // ending on the box only says which side it leaves toward.
+        let pull = 0;
+        let pulls = 0;
+        byAim.forEach((attachment, i) => {
+            if (!Number.isFinite(attachment.preferX)) return;
+            pull += aim(attachment) - i * pitch;
+            pulls++;
+        });
+        assert(pulls > 0, 'a preferred edge has at least one preferred port');
+        const left = clamp(pull / pulls, low, high - span);
+
+        const result = {};
+        byAim.forEach((attachment, i) => { result[attachment.key] = left + i * pitch; });
+        return result;
+    }
+
+    /**
+     * @brief Places ports on a wrapper box edge each at its own aim.
+     *
+     * A wrapper is never drawn, so its ports are not a visible group. Each
+     * sits where its wire crosses, pushed apart only to the minimum pitch.
+     *
+     * @param {Object} node - Wrapper box node carrying centreX and width.
+     * @param {Array} ordered - Attachments in any order; they are re-sorted by aim.
+     * @param {number} pitch - Least spacing between neighbouring ports.
+     * @param {number} usable - Edge width less the inset on both sides.
+     * @returns {Object|null} Map from key to port X, or null when the edge is
+     *                        too short to hold every port at the minimum pitch.
+     */
+    function placeThroughPorts(node, ordered, pitch, usable) {
+        const count = ordered.length;
+        assert(count > 0, 'an edge with no ports needs no placing');
+        assert(pitch > 0, 'portPitch must be positive');
+        if (usable < pitch * (count - 1) - EPSILON) return null;
+
+        const low = node.centreX - usable / 2;
+        const high = node.centreX + usable / 2;
+        const aim = a => clamp(Number.isFinite(a.preferX) ? a.preferX : a.idealX, low, high);
+        const byAim = ordered.slice().sort((a, b) => {
+            if (Math.abs(aim(a) - aim(b)) > EPSILON) return aim(a) - aim(b);
+            return String(a.key) < String(b.key) ? -1 : 1;
+        });
+
         // Push right to make the pitch, then back left from the far end. The
         // length check above means the left pass never runs past low.
         const xs = byAim.map(aim);
         for (let i = 1; i < count; i++) xs[i] = Math.max(xs[i], xs[i - 1] + pitch);
         xs[count - 1] = Math.min(xs[count - 1], high);
         for (let i = count - 2; i >= 0; i--) xs[i] = Math.min(xs[i], xs[i + 1] - pitch);
-        assert(xs[0] >= low - EPSILON, 'preferred ports ran past the left inset');
 
         const result = {};
         byAim.forEach((attachment, i) => { result[attachment.key] = xs[i]; });
@@ -883,7 +935,12 @@
         }
 
         const portX = {};  // "nodeId|edge|key" -> pixel X
+        // Edges whose ports were placed as one even group. Their ports stay
+        // put from here on, or a later pass would break the even spacing.
+        const groupedEdges = new Set();
         for (const edgeKey in edgeAttachments) {
+            if (!nodeIndex[edgeKey.split('|')[0]].node.passThrough
+                && edgeAttachments[edgeKey].some(a => Number.isFinite(a.preferX))) groupedEdges.add(edgeKey);
             const nodeId = edgeKey.split('|')[0];
             const assigned = assignPorts(nodeIndex[nodeId].node, edgeAttachments[edgeKey], geometry);
             for (const key in assigned) {
@@ -971,12 +1028,18 @@
          * @brief Allowed X range for a port sliding along a node edge.
          *
          * A zero-width boundary node is a port the level above has already
-         * fixed, so it may not slide at all.
+         * fixed, so it may not slide at all. Nor may a port on an edge placed
+         * as one even group.
          *
          * @param {Object} node - Node the port belongs to.
+         * @param {string} edgeKey - "nodeId|edge" of the port.
+         * @param {number} x - The port's current X.
          * @returns {Object} { minX, maxX } in pixels.
          */
-        function portRange(node) {
+        function portRange(node, edgeKey, x) {
+            // WHY: straightening slid one port of an even group onto the far
+            // end's column, which left the gaps on that box edge uneven.
+            if (groupedEdges.has(edgeKey)) return { minX: x, maxX: x };
             if (node.boundary && node.width === 0) {
                 return { minX: node.centreX, maxX: node.centreX };
             }
@@ -1004,7 +1067,7 @@
             const firstGap = net.gaps[0];
             const lastGap = net.gaps[net.gaps.length - 1];
 
-            const sourceRange = portRange(net.source);
+            const sourceRange = portRange(net.source, net.from + '|' + net.sourceEdge, net.sourceX);
             net.sourceEntry = {
                 netId: net.id,
                 x: net.sourceX,
@@ -1018,7 +1081,7 @@
             // A bus shares one drop, so only the first member registers it.
             const busOwner = net.busKey ? buses[net.busKey] : null;
             if (!busOwner || busOwner.members[0] === net) {
-                const targetRange = portRange(net.target);
+                const targetRange = portRange(net.target, net.to + '|' + net.targetEdge, net.targetX);
                 net.targetEntry = {
                     netId: busOwner ? 'bus:' + net.busKey : net.id,
                     x: net.targetX,
