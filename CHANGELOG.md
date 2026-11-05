@@ -1,9 +1,48 @@
 # Changelog
 
-## 2026-11-04
+## 2026-11-05
+
+### Fixed
+
+- `font: 123` crashed the preview. A numeric font name is now kept as text.
+- A corner radius near half a node's width collapsed every port onto the node centre, so wires overlapped. The port inset is capped at a quarter of the node width.
+- `theme: toString` and similar built-in names reached every stroke as a colour. Only listed themes are used.
+- When a preview fails, the dialog now also lists the style issues already found.
+- The harness reads the whole preview pane, and also flags event handler and link attributes and duplicate `<svg>`, `<style>` or `<defs>`. The bare `&` check is gone, since the browser re-escapes text before the harness sees it.
 
 ### Changed
 
+- Misspelled style keys are reported instead of ignored.
+- `section-padding`, `node-padding` and `page-margin` must be 1, 2 or 4 numbers from 0 to 10000.
+- `uppercase`, `node-uniform` and `node-fill` accept only `true` or `false`. Values such as `0` are reported and the default used.
+
+## 2026-11-04
+
+### Added
+
+- `node-fill: true` fills each node with its outline colour.
+- `node-text-color` and `hint-text-color` set the node name and hint colours. Only hex colours are accepted. A bad value is reported and the default kept.
+- `corner-style: round | square | chamfer` sets the corner shape for nodes, boxes and wires together. `round` is the default and renders exactly as before.
+- Node and box shapes carry `data-kind="node"` or `data-kind="section"`. The harness margin check finds them by that instead of by corner radius.
+- `js/style.js`, a pure module holding style parsing, checks and outline markup, with `test/style.test.js` covering it.
+- The harness fails a render that holds a tag the renderer never emits.
+
+### Fixed
+
+- Node names and hints reached the SVG unescaped, so text such as `<i>` became live markup in the preview. Both are now escaped.
+- `font` and `hint-font` reached the SVG `<style>` block unchecked. Only plain font names are accepted, and every space in the font URL is encoded, not just the first.
+- A negative or non-finite number, such as `node-radius: -3`, gave invalid SVG. Numbers must be from 0 to 10000.
+- With a large radius, a wire could end on a rounded or chamfered corner. Ports now stay at least one radius in from the edge.
+
+### Changed
+
+- Every rejected style value is reported with the default used in its place.
+- Preview issues show in one dialog grouped into Style, Connections and Routing, so a bad setting no longer reads as an unresolved connection.
+- Messages say what happened as a result, such as "The wire was skipped", and use "color" throughout.
+
+### Changed
+
+- `README.md` is now one syntax table and one settings table. Settings the code never reads are gone, and `theme` lists `kelly` and `okabe-ito`.
 - Ports on a drawn box edge form one evenly spaced group, in the order of the wires they carry. The group sits where the wires continuing inside the box pull it, so a wire ending on the box no longer gets flung to the corner. On `interstack.flow` both USV and ROV bottom edges now have three evenly spaced ports.
 - Ports in an even group are pinned, so the straightening pass no longer slides one out of line.
 - An unnamed layout wrapper box is never drawn, so its edge does not group ports. Each wire crosses it where it leaves the box inside, found in a children-first pass in `joinBoundaries()`, so no wire jogs inside a wrapper.

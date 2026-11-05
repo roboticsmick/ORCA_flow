@@ -265,7 +265,7 @@
             if (inB.has(box.id)) { lca = box; break; }
         }
         console.assert(lca, 'two placed boxes must share the root');
-        if (!lca) return { pieces: [], error: 'The layout has no common ancestor for these endpoints.' };
+        if (!lca) return { pieces: [], error: 'The layout has no common ancestor for these endpoints. The wire was skipped.' };
 
         // WHY: a box joined to something inside itself has no edge between
         // the two to cross. Decomposing it anyway left a piece whose end was

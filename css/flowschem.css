@@ -553,6 +553,10 @@ body {
 .modal-body p {
     margin: 0;
     line-height: 1.6;
+    /* Issue lists are joined with newlines, one message per line. */
+    white-space: pre-line;
+    max-height: 60vh;
+    overflow-y: auto;
 }
 
 .modal-footer {

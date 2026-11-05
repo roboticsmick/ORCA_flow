@@ -93,18 +93,22 @@ Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px
 | `line-palette` | comma-separated hex colours | none | The palette for `line-theme: custom`, for example `#e6194b, #3cb44b, #4363d8`. |
 | `font` | any Google Font | `Roboto Mono` | Node and box label font. |
 | `font-weight` | 100 to 900 | `500` | Node and box label weight. |
-| `font-size` | any number | `14` | Node label size in px. Box labels are 2px larger. |
+| `font-size` | 0 to 10000 | `14` | Node label size in px. Box labels are 2px larger. |
 | `hint-font` | any Google Font | `Roboto Mono` | Hint line font. |
 | `hint-weight` | 100 to 900 | `300` | Hint line weight. |
-| `hint-size` | any number | `11` | Hint line size in px. |
+| `hint-size` | 0 to 10000 | `11` | Hint line size in px. |
 | `uppercase` | `true`, `false` | `true` | Shows node and box labels in capitals. |
-| `node-min-width` | any number | `120` | Node width in px. |
+| `node-min-width` | 0 to 10000 | `120` | Node width in px. |
 | `node-padding` | 1, 2 or 4 numbers | `10 14 10 14` | Space inside a node in px, top right bottom left. |
-| `node-radius` | any number | `6` | Node corner radius in px. |
-| `node-border` | any number | `2` | Node outline width in px. |
-| `section-radius` | any number | `8` | Box corner radius in px. |
-| `section-border` | any number | `2` | Box outline width in px. |
-| `line-thickness` | any number | `2` | Wire width in px. |
-| `line-spacing` | any number | `15` | Space between parallel wires in px. |
-| `corner-radius` | any number | `4` | Wire corner radius in px. |
+| `node-radius` | 0 to 10000 | `6` | Node corner radius in px. |
+| `node-border` | 0 to 10000 | `2` | Node outline width in px. |
+| `node-fill` | `true`, `false` | `false` | Fills each node with its outline colour. |
+| `node-text-color` | hex colour | `#333333` | Node name colour. Set `#ffffff` with `node-fill: true`. |
+| `hint-text-color` | hex colour | `#666666` | Hint line colour. |
+| `corner-style` | `round`, `square`, `chamfer` | `round` | Corner shape for nodes, boxes and wires. `chamfer` cuts each corner at 45 degrees by its radius. |
+| `section-radius` | 0 to 10000 | `8` | Box corner radius in px. |
+| `section-border` | 0 to 10000 | `2` | Box outline width in px. |
+| `line-thickness` | 0 to 10000 | `2` | Wire width in px. |
+| `line-spacing` | 0 to 10000 | `15` | Space between parallel wires in px. |
+| `corner-radius` | 0 to 10000 | `4` | Wire corner radius in px. |
 | `page-margin` | 1, 2 or 4 numbers | `10 10 10 10` | Space around the diagram in mm, top right bottom left. |

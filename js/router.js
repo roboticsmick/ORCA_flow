@@ -293,6 +293,25 @@
     // =========================================================================
 
     /**
+     * @brief How far ports keep in from each end of a node edge.
+     *
+     * The inset follows the corner radius so a port never lands on a rounded
+     * or chamfered corner, but it is capped at a quarter of the width.
+     *
+     * @param {Object} node - Node with a width in pixels.
+     * @param {Object} geometry - Geometry holding portInset.
+     * @returns {number} Inset in pixels, from 0 to node.width / 4.
+     */
+    function edgeInset(node, geometry) {
+        console.assert(Number.isFinite(node.width) && node.width >= 0, 'a node needs a width');
+        console.assert(Number.isFinite(geometry.portInset), 'geometry needs a port inset');
+        // WHY: the inset follows a user-set radius. A radius near half the
+        // node width left no usable edge, so every port collapsed onto the
+        // centre and the wires overlapped.
+        return Math.max(0, Math.min(geometry.portInset, node.width / 4));
+    }
+
+    /**
      * @brief Spreads ports evenly across one edge of a node.
      *
      * Ports are ordered by the X each wire heads toward, which is what stops
@@ -320,7 +339,7 @@
             return String(a.key) < String(b.key) ? -1 : 1;
         });
 
-        const usable = Math.max(0, node.width - 2 * geometry.portInset);
+        const usable = Math.max(0, node.width - 2 * edgeInset(node, geometry));
         const even = count > 1 ? usable / (count - 1) : 0;
 
         const pitch = count > 1
@@ -1043,9 +1062,10 @@
             if (node.boundary && node.width === 0) {
                 return { minX: node.centreX, maxX: node.centreX };
             }
+            const inset = edgeInset(node, geometry);
             return {
-                minX: node.centreX - node.width / 2 + geometry.portInset,
-                maxX: node.centreX + node.width / 2 - geometry.portInset
+                minX: node.centreX - node.width / 2 + inset,
+                maxX: node.centreX + node.width / 2 - inset
             };
         }
 
@@ -1667,21 +1687,24 @@
     // =========================================================================
 
     /**
-     * @brief Joins a net's segments into one SVG path with rounded corners.
+     * @brief Joins a net's segments into one SVG path with styled corners.
      *
      * Consecutive segments share an endpoint, so the path is emitted as a
      * polyline whose corners are replaced by quadratic arcs of the configured
-     * radius. A corner is only rounded when both adjoining segments are long
-     * enough to give up the radius.
+     * radius, or by straight 45 degree cuts for `chamfer`. A corner is only
+     * shaped when both adjoining segments are long enough to give up the
+     * radius. `square` keeps every corner sharp.
      *
      * @param {Array} points - Ordered path points as { x, y }.
      * @param {number} radius - Corner radius in pixels.
+     * @param {string} [cornerStyle='round'] - 'round', 'square' or 'chamfer'.
      * @returns {string} An SVG path data string, empty when fewer than 2 points.
      */
-    function pathData(points, radius) {
+    function pathData(points, radius, cornerStyle) {
         if (!points || points.length < 2) return '';
         const r = radius === undefined ? DEFAULT_GEOMETRY.cornerRadius : radius;
-        if (r <= 0 || points.length === 2) {
+        const chamfer = cornerStyle === 'chamfer';
+        if (r <= 0 || points.length === 2 || cornerStyle === 'square') {
             return 'M ' + points.map(p => p.x + ' ' + p.y).join(' L ');
         }
 
@@ -1707,7 +1730,9 @@
             const outY = here.y + (next.y - here.y) / outLen * cut;
 
             d += ' L ' + inX + ' ' + inY;
-            d += ' Q ' + here.x + ' ' + here.y + ' ' + outX + ' ' + outY;
+            d += chamfer
+                ? ' L ' + outX + ' ' + outY
+                : ' Q ' + here.x + ' ' + here.y + ' ' + outX + ' ' + outY;
         }
 
         const last = points[points.length - 1];

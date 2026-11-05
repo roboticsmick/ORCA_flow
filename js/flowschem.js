@@ -76,37 +76,8 @@ const Elements = {
 // 3. DEFAULT STYLE CONFIGURATION
 // =============================================================================
 
-const DefaultStyle = {
-    'section-radius': 8,
-    'section-border': 2,
-    'node-radius': 6,
-    'node-border': 2,
-    'line-thickness': 2,
-    'font': 'Roboto Mono',
-    'font-weight': 500,
-    'font-size': 14,
-    'hint-font': 'Roboto Mono',
-    'hint-weight': 300,
-    'hint-size': 11,
-    'section-padding': '20 16 20 16',
-    'node-padding': '10 14 10 14',
-    'flow': 'down',
-    'uppercase': true,
-    'theme': 'engineering',
-    'line-theme': true,
-    'page-size': 'A4',
-    'page-orientation': 'landscape',
-    'page-margin': '10 10 10 10',
-    'node-min-width': 120,
-    'node-min-height': 60,
-    'node-uniform': true
-};
-
-/** Style keys that hold a number, so a parsed value must become one. */
-const NumericStyleKeys = new Set(
-    Object.keys(DefaultStyle).filter(key => typeof DefaultStyle[key] === 'number')
-        .concat(['line-spacing', 'corner-radius'])
-);
+// Style parsing, checks and outline markup live in js/style.js.
+const { parseStyle, boxShape, escapeXml, fontUrlName } = OrcaStyle;
 
 // =============================================================================
 // 4. COLOUR THEMES
@@ -197,6 +168,31 @@ function showModal(title, message) {
 }
 
 /**
+ * @brief Reports the issues a preview found, grouped by where they came from.
+ *
+ * A style issue used to appear under "Unresolved connections", so a bad
+ * colour read as a wiring fault. Each group now carries its own heading.
+ *
+ * @param {string} detail - Node and connection counts for the status bar.
+ * @param {Array} groups - { title, messages } in display order.
+ */
+function reportIssues(detail, groups) {
+    console.assert(typeof detail === 'string', 'reportIssues needs a detail line');
+    console.assert(Array.isArray(groups) && groups.length > 0, 'reportIssues needs groups');
+    const filled = groups.filter(group => group.messages.length > 0);
+    const total = filled.reduce((sum, group) => sum + group.messages.length, 0);
+    if (total === 0) {
+        setStatus('Preview generated', 'success', detail);
+        return;
+    }
+    const noun = total === 1 ? 'issue' : 'issues';
+    setStatus('Preview generated with ' + total + ' ' + noun, 'error', detail);
+    showModal('Preview generated with ' + total + ' ' + noun, filled
+        .map(group => group.title + '\n' + group.messages.map(m => '- ' + m).join('\n'))
+        .join('\n\n'));
+}
+
+/**
  * Hides the modal dialog.
  */
 function hideModal() {
@@ -225,60 +221,6 @@ function downloadFile(content, filename, mimeType) {
 // =============================================================================
 // 7. PARSER FUNCTIONS
 // =============================================================================
-
-/**
- * Parses the style block from input text.
- * 
- * @param {string} input - Raw style input text.
- * @returns {Object} Parsed style configuration.
- */
-function parseStyle(input) {
-    const config = { ...DefaultStyle };
-    
-    if (!input || !input.trim()) {
-        return config;
-    }
-    
-    const lines = input.split('\n');
-    
-    for (const line of lines) {
-        const trimmed = line.trim();
-        
-        // Skip empty lines, comments, and @style header
-        if (!trimmed || trimmed.startsWith('#') || trimmed === '@style') {
-            continue;
-        }
-        
-        // Parse key: value pairs
-        const colonIndex = trimmed.indexOf(':');
-        if (colonIndex > 0) {
-            const key = trimmed.substring(0, colonIndex).trim();
-            let value = trimmed.substring(colonIndex + 1).trim();
-            
-            // Convert value types
-            if (value === 'true') {
-                value = true;
-            } else if (value === 'false') {
-                value = false;
-            } else if (!isNaN(value) && value !== '') {
-                value = parseFloat(value);
-            }
-
-            // WHY: a numeric setting written with a unit, such as `14px`, used
-            // to stay a string, so sizes came out NaN or as concatenated text,
-            // and any string reaches SVG markup. A numeric key keeps only its
-            // number, or the default when there is none.
-            if (NumericStyleKeys.has(key) && typeof value !== 'number') {
-                const number = parseFloat(value);
-                value = Number.isFinite(number) ? number : DefaultStyle[key];
-            }
-
-            config[key] = value;
-        }
-    }
-    
-    return config;
-}
 
 /**
  * Parses the layout block from input text.
@@ -509,8 +451,8 @@ function parseEndpoint(str) {
         if (OrcaTraces.isHexColour(value)) {
             colour = value;
         } else {
-            colourError = "Wire colour '{" + value + "}' on '" + trimmed
-                + "' is not a hex colour such as {#e6194b}.";
+            colourError = "Wire color '{" + value + "}' on '" + trimmed
+                + "' is not a hex color such as {#e6194b}. The wire keeps its default color.";
         }
     }
     const colon = trimmed.indexOf(':');
@@ -554,10 +496,10 @@ function resolveLinkEndpoint(endpoint, localKey, ctx) {
     if (endpoint.qualifier) {
         const key = endpoint.qualifier;
         if (!ctx.scope.sections.has(key)) {
-            return { kind: 'error', message: "Unknown section '" + key + "' in '" + key + ':' + endpoint.name + "'." };
+            return { kind: 'error', message: "Unknown section '" + key + "' in '" + key + ':' + endpoint.name + "'. The wire was skipped." };
         }
         if (!declared || !declared.has(key)) {
-            return { kind: 'error', message: "Section '" + key + "' has no node '" + endpoint.name + "'." };
+            return { kind: 'error', message: "Section '" + key + "' has no node '" + endpoint.name + "'. The wire was skipped." };
         }
         return { kind: 'node', id: generateNodeId(endpoint.name, key), sectionKey: key };
     }
@@ -587,7 +529,7 @@ function resolveLinkEndpoint(endpoint, localKey, ctx) {
         return { kind: 'error', message: "'" + endpoint.name + "' is ambiguous: " + candidates.join(', ')
             + ". Write " + candidates[0] + ':' + endpoint.name + "." };
     }
-    return { kind: 'error', message: "Unknown endpoint '" + endpoint.name + "' in block '" + localKey + "'." };
+    return { kind: 'error', message: "Unknown endpoint '" + endpoint.name + "' in block '" + localKey + "'. The wire was skipped." };
 }
 
 /**
@@ -770,7 +712,7 @@ function parseNodes(input, layoutTree) {
 function reportColourErrors(parsed, errors) {
     const source = parsed.sourceRaw;
     if (source.colour || source.colourError) {
-        errors.push("A wire colour goes after a target, not after '" + source.name + "'.");
+        errors.push("A wire color goes after a target, not after '" + source.name + "'. It was ignored.");
     }
     for (const target of parsed.targetsRaw) {
         if (target.colourError) errors.push(target.colourError);
@@ -1196,7 +1138,9 @@ function getSectionPlan(nodesData, sectionKey, style, uniformGapHeight = 0) {
         hTrackPitch: style['line-spacing'] || 15,
         clearance: 10,
         portPitch: 12,
-        portInset: 8,
+        // WHY: a port closer to the edge than the node radius lands on the
+        // rounded or chamfered corner, so a wire ends in empty space.
+        portInset: Math.max(8, style['node-radius']),
         arrowClearance: 12,
         cornerRadius: style['corner-radius'] !== undefined ? style['corner-radius'] : 4
     };
@@ -1661,7 +1605,9 @@ function gutterGeometry(style) {
         hTrackPitch: style['line-spacing'] || 15,
         clearance: 10,
         portPitch: 12,
-        portInset: 8,
+        // WHY: a port closer to the edge than the box radius lands on the
+        // rounded or chamfered corner, so a wire ends in empty space.
+        portInset: Math.max(8, style['section-radius']),
         arrowClearance: 12,
         cornerRadius: style['corner-radius'] !== undefined ? style['corner-radius'] : 4
     };
@@ -1964,7 +1910,7 @@ function renderSection(bundle, bounds, edges, style, color) {
     let svg = '<g transform="translate(' + offsetX + ',0)">';
 
     for (const line of emitted.polylines) {
-        const d = OrcaRouter.pathData(line.points, cornerRadius);
+        const d = OrcaRouter.pathData(line.points, cornerRadius, style['corner-style']);
         svg += '<path d="' + d + '" fill="none" stroke="' + colourOf(line.netId) + '"'
             + ' stroke-width="' + lineThickness + '"'
             + ' stroke-linecap="round" stroke-linejoin="round"'
@@ -1998,6 +1944,9 @@ function renderSection(bundle, bounds, edges, style, color) {
  * @returns {string} SVG markup for the boxes and their text.
  */
 function renderSectionNodes(sectionLayout, rowTops, offsetX, nodeHeight, style, color) {
+    console.assert(Array.isArray(sectionLayout.rows) && rowTops.length >= sectionLayout.rows.length,
+        'every row needs a top');
+    console.assert(Number.isFinite(nodeHeight) && nodeHeight > 0, 'node height must be positive');
     let svg = '';
     const fontSize = style['font-size'] || 14;
 
@@ -2008,22 +1957,24 @@ function renderSectionNodes(sectionLayout, rowTops, offsetX, nodeHeight, style, 
             const width = node.pixelWidth;
             const left = offsetX + node.localX - width / 2;
 
-            svg += '<rect x="' + left + '" y="' + top + '" width="' + width
-                + '" height="' + nodeHeight + '"'
-                + ' rx="' + style['node-radius'] + '" ry="' + style['node-radius'] + '"'
-                + ' fill="#ffffff" stroke="' + color + '"'
-                + ' stroke-width="' + style['node-border'] + '"/>';
+            const fill = style['node-fill'] ? color : '#ffffff';
+            svg += boxShape({ x: left, y: top, width: width, height: nodeHeight },
+                style['node-radius'], style['corner-style'],
+                'fill="' + fill + '" stroke="' + color + '"'
+                + ' stroke-width="' + style['node-border'] + '" data-kind="node"');
 
             const textX = offsetX + node.localX;
             const nameY = top + (node.hint ? nodeHeight / 2 - 5 : nodeHeight / 2 + fontSize / 2 - 1);
             const displayName = style.uppercase ? node.name.toUpperCase() : node.name;
 
+            // WHY: node names and hints are typed by the user and the SVG is
+            // shown through innerHTML, so unescaped text became live markup.
             svg += '<text x="' + textX + '" y="' + nameY + '" class="node-text">'
-                + displayName + '</text>';
+                + escapeXml(displayName) + '</text>';
 
             if (node.hint) {
                 svg += '<text x="' + textX + '" y="' + (top + nodeHeight / 2 + 12)
-                    + '" class="hint-text">' + node.hint + '</text>';
+                    + '" class="hint-text">' + escapeXml(node.hint) + '</text>';
             }
         }
     });
@@ -2111,7 +2062,9 @@ function planDiagram(style, layout, nodesData) {
     if (typeof window !== 'undefined' && window.ORCA_VERIFY) window.OrcaCheck = { sections: [] };
 
     const margin = parsePadding(style['page-margin']);
-    const themeColors = Themes[style.theme] || Themes.default;
+    // WHY: a plain lookup of `toString` or `constructor` returned a built-in
+    // function, which then reached every stroke as a colour.
+    const themeColors = Object.hasOwn(Themes, style.theme) ? Themes[style.theme] : Themes.default;
 
     // Pass 1. Split every net that crosses a box edge into per-level pieces.
     // The gutter planner reads these, and sizing reads the gutter plans, so
@@ -2178,7 +2131,7 @@ function planDiagram(style, layout, nodesData) {
  * `custom` reads the hex colours listed in `line-palette`.
  *
  * @param {Object} style - Style configuration.
- * @param {Array} errors - Parse errors, appended to.
+ * @param {Array} errors - Style issues, appended to.
  * @returns {Array|null} Palette, or null when wires take box colours.
  */
 function lineThemePalette(style, errors) {
@@ -2189,16 +2142,16 @@ function lineThemePalette(style, errors) {
         const listed = String(style['line-palette'] || '').split(',').map(c => c.trim());
         const palette = listed.filter(c => OrcaTraces.isHexColour(c));
         for (const bad of listed.filter(c => c && !OrcaTraces.isHexColour(c))) {
-            errors.push("line-palette entry '" + bad + "' is not a hex colour such as #e6194b.");
+            errors.push("line-palette entry '" + bad + "' is not a hex color such as #e6194b. It was skipped.");
         }
         if (palette.length > 0) return palette;
-        errors.push('line-theme: custom needs line-palette with at least one hex colour.');
+        errors.push('line-theme: custom needs line-palette with at least one hex color. Using box colors.');
         return null;
     }
 
-    if (Themes[name]) return Themes[name];
+    if (Object.hasOwn(Themes, name)) return Themes[name];
     errors.push("line-theme '" + name + "' is not one of box, custom, "
-        + Object.keys(Themes).join(', ') + '.');
+        + Object.keys(Themes).join(', ') + '. Using box colors.');
     return null;
 }
 
@@ -2210,11 +2163,12 @@ function lineThemePalette(style, errors) {
  *
  * @param {Object} style - Style configuration.
  * @param {Object} placement - { order } from placeLayout(), may be null.
- * @param {Object} nodesData - Parsed nodes; errors are appended to it.
+ * @param {Object} nodesData - Parsed nodes; bus colour conflicts are appended to its errors.
+ * @param {Array} styleErrors - Style issues, appended to by the line-theme check.
  * @returns {Array|null} Colour per connection index, or null for box colours.
  */
-function planTraceColours(style, placement, nodesData) {
-    const palette = lineThemePalette(style, nodesData.errors);
+function planTraceColours(style, placement, nodesData, styleErrors) {
+    const palette = lineThemePalette(style, styleErrors);
     const overrides = {};
     for (const conn of nodesData.connections) {
         if (conn.colour) overrides[conn.index] = conn.colour;
@@ -2241,7 +2195,7 @@ function planTraceColours(style, placement, nodesData) {
     const result = OrcaTraces.assignColours(traces, palette || [null], overrides);
     for (const conflict of result.conflicts) {
         nodesData.errors.push('Wires sharing one bus asked for ' + conflict.kept + ' and '
-            + conflict.dropped + '. Kept ' + conflict.kept + '.');
+            + conflict.dropped + '. A bus is drawn in one color, so ' + conflict.kept + ' was kept.');
     }
     return result.colours;
 }
@@ -2280,6 +2234,44 @@ function wireColourLookup(plan, fallback) {
 }
 
 /**
+ * @brief Builds the SVG <defs> block holding the text classes.
+ * @pre style passed checkStyle(), so fonts and colours are safe in CSS.
+ * @param {Object} style - Checked style.
+ * @returns {string} The <defs> markup.
+ */
+function svgStyleDefs(style) {
+    console.assert(typeof style.font === 'string', 'font must be a checked string');
+    console.assert(typeof style['node-text-color'] === 'string', 'text colour must be checked');
+    return `<defs>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=${fontUrlName(style.font)}:wght@100;200;300;400;500;600;700;800;900&display=swap');
+            .node-text {
+                font-family: '${style.font}', sans-serif;
+                font-weight: ${style['font-weight']};
+                font-size: ${style['font-size']}px;
+                fill: ${style['node-text-color']};
+                text-anchor: middle;
+                dominant-baseline: middle;
+            }
+            .hint-text {
+                font-family: '${style['hint-font']}', sans-serif;
+                font-weight: ${style['hint-weight']};
+                font-size: ${style['hint-size']}px;
+                fill: ${style['hint-text-color']};
+                text-anchor: middle;
+                dominant-baseline: middle;
+            }
+            .section-label {
+                font-family: '${style.font}', sans-serif;
+                font-weight: ${style['font-weight']};
+                font-size: ${style['font-size'] + 2}px;
+                text-anchor: middle;
+            }
+        </style>
+    </defs>`;
+}
+
+/**
  * @brief Renders the diagram to SVG from its plan.
  *
  * The diagram is sized to fit its content, not a fixed page size, which keeps
@@ -2288,12 +2280,14 @@ function wireColourLookup(plan, fallback) {
  * @param {Object} style - Style configuration.
  * @param {Object} layout - Layout tree.
  * @param {Object} nodesData - Parsed nodes and connections.
+ * @param {Array} styleErrors - Style issues, appended to by line-theme checks.
  * @returns {string} SVG markup string.
  */
-function renderDiagram(style, layout, nodesData) {
+function renderDiagram(style, layout, nodesData, styleErrors) {
+    console.assert(Array.isArray(styleErrors), 'renderDiagram needs a style error list');
     const plan = planDiagram(style, layout, nodesData);
     LastDiagramPlan = plan;
-    ActiveTraceColours = planTraceColours(style, plan.placement, nodesData);
+    ActiveTraceColours = planTraceColours(style, plan.placement, nodesData, styleErrors);
 
     const margin = plan.margin;
     const themeColors = plan.themeColors;
@@ -2309,34 +2303,7 @@ function renderDiagram(style, layout, nodesData) {
         viewBox="0 0 ${totalWidth} ${totalHeight}"
         style="background-color: transparent;">`;
 
-    // Add defs for patterns, gradients, etc.
-    svg += `<defs>
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=${style.font.replace(' ', '+')}:wght@100;200;300;400;500;600;700;800;900&display=swap');
-            .node-text {
-                font-family: '${style.font}', sans-serif;
-                font-weight: ${style['font-weight']};
-                font-size: ${style['font-size']}px;
-                fill: #333333;
-                text-anchor: middle;
-                dominant-baseline: middle;
-            }
-            .hint-text {
-                font-family: '${style['hint-font']}', sans-serif;
-                font-weight: ${style['hint-weight']};
-                font-size: ${style['hint-size']}px;
-                fill: #666666;
-                text-anchor: middle;
-                dominant-baseline: middle;
-            }
-            .section-label {
-                font-family: '${style.font}', sans-serif;
-                font-weight: ${style['font-weight']};
-                font-size: ${style['font-size'] + 2}px;
-                text-anchor: middle;
-            }
-        </style>
-    </defs>`;
+    svg += svgStyleDefs(style);
 
     // Emit the placed boxes. Every wire, inside a section or across boxes,
     // is drawn by the level that routes it.
@@ -2928,19 +2895,6 @@ function checkJoins() {
     };
 }
 
-/**
- * @brief Escapes text for use inside SVG markup or an attribute value.
- * @param {*} value - Value to escape.
- * @returns {string} Text with &, <, >, " and ' replaced by entities.
- */
-function escapeXml(value) {
-    return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
 
 /**
  * @brief Emits the SVG for a placement, boxes first and contents after.
@@ -2965,9 +2919,8 @@ function emitPlacement(placement, style, themeColors) {
     for (const box of placement.order) {
         if (box.type !== 'segment') continue;
 
-        svg += `<rect x="${box.x}" y="${box.y}" width="${box.width}" height="${box.height}"
-            rx="${style['section-radius']}" ry="${style['section-radius']}"
-            fill="#ffffff" stroke="${box.color}" stroke-width="${style['section-border']}"/>`;
+        svg += boxShape(box, style['section-radius'], style['corner-style'],
+            `fill="#ffffff" stroke="${box.color}" stroke-width="${style['section-border']}" data-kind="section"`);
 
         // A wire entering through the top edge passes the label, so labels go
         // on last over a backing that breaks the wire rather than the text.
@@ -3062,7 +3015,7 @@ function renderGutter(box, style, themeColors) {
     let svg = '<g transform="translate(' + box.bounds.x + ',0)">';
 
     for (const line of emitted.polylines) {
-        svg += '<path d="' + OrcaRouter.pathData(line.points, cornerRadius) + '"'
+        svg += '<path d="' + OrcaRouter.pathData(line.points, cornerRadius, style['corner-style']) + '"'
             + ' fill="none" stroke="' + colourOf(line.netId) + '"'
             + ' stroke-width="' + lineThickness + '"'
             + ' stroke-linecap="round" stroke-linejoin="round"'
@@ -3163,7 +3116,7 @@ function parsePadding(paddingStr) {
 async function exportPng() {
     const svgElement = Elements.previewCanvas.querySelector('svg');
     if (!svgElement) {
-        showModal('Export Error', 'No diagram to export. Please generate a preview first.');
+        showModal('Nothing to export', 'Generate a preview first, then export it.');
         return;
     }
 
@@ -3211,7 +3164,7 @@ async function exportPng() {
     img.onerror = function() {
         URL.revokeObjectURL(url);
         setStatus('PNG export failed', 'error');
-        showModal('Export Error', 'Failed to render PNG. Try using a browser print to PDF instead.');
+        showModal('PNG export failed', 'The diagram could not be drawn to a PNG. Use the browser print to PDF instead.');
     };
 
     img.src = url;
@@ -3222,7 +3175,7 @@ async function exportPng() {
  * Note: Basic implementation - for production, use a library like jsPDF.
  */
 function exportPdf() {
-    showModal('Export PDF', 'PDF export requires the jsPDF library. For now, please use PNG export or print to PDF from your browser.');
+    showModal('PDF export unavailable', 'PDF export needs the jsPDF library, which is not loaded. Use PNG export, or print to PDF from the browser.');
 }
 
 /**
@@ -3269,7 +3222,7 @@ function loadFlow(file) {
     };
     
     reader.onerror = function() {
-        showModal('Load Error', 'Failed to read the file.');
+        showModal('Could not load file', 'The file could not be read. Check it is a .flow text file and try again.');
     };
     
     reader.readAsText(file);
@@ -3285,78 +3238,84 @@ function loadFlow(file) {
 function generatePreview() {
     setStatus('Generating preview...', 'info');
     Elements.btnGenerate.classList.add('generating');
-    
+
     // Small delay for UI feedback
     setTimeout(() => {
+        const parsedStyle = parseStyle(Elements.styleInput.value);
         try {
-            // Parse inputs
-            const style = parseStyle(Elements.styleInput.value);
-            const layout = parseLayout(Elements.layoutInput.value);
-            const nodesData = parseNodes(Elements.nodesInput.value, layout);
-            
-            // Store in app state
-            AppState.styleConfig = style;
-            AppState.layoutTree = layout;
-            AppState.nodes = nodesData.nodes;
-            AppState.connections = nodesData.connections;
-            
-            // Render diagram
-            const svg = renderDiagram(style, layout, nodesData);
-            
-            // Display in preview
-            Elements.previewPlaceholder.style.display = 'none';
-            Elements.previewCanvas.style.display = 'block';
-            Elements.previewCanvas.innerHTML = svg;
-            
-            // Enable export buttons
-            Elements.btnExportPdf.disabled = false;
-            Elements.btnExportPng.disabled = false;
-            
-            AppState.diagramGenerated = true;
-
-            // Fit diagram to window by default
-            zoomFit();
-
-            const nodeCount = nodesData.nodes.length;
-            const connCount = nodesData.connections.length;
-            const detail = `${nodeCount} nodes, ${connCount} connections`;
-
-            // An endpoint that cannot be resolved used to vanish without a
-            // word, which is how every cross-section wire stayed missing.
-            if (typeof window !== 'undefined' && window.ORCA_VERIFY) {
-                const levels = LastDiagramPlan.levels;
-                window.OrcaDebug = {
-                    errors: nodesData.errors,
-                    levelErrors: levels.errors,
-                    levels: Object.keys(levels.byLevel).map(id => ({
-                        level: levels.tree.boxes[id] === levels.tree.root
-                            ? 'root'
-                            : (levels.tree.boxes[id].name || 'anon'),
-                        kind: levels.tree.boxes[id].kind,
-                        pieces: levels.byLevel[id].length
-                    }))
-                };
-            }
-            const levelErrors = LastDiagramPlan ? LastDiagramPlan.levels.errors : [];
-            if (nodesData.errors.length > 0) {
-                setStatus('Preview generated with unresolved links', 'error',
-                    `${detail}, ${nodesData.errors.length} unresolved`);
-                showModal('Unresolved connections', nodesData.errors.concat(levelErrors).join('\n'));
-            } else if (levelErrors.length > 0) {
-                setStatus('Preview generated with routing warnings', 'error', detail);
-                showModal('Routing warnings', levelErrors.join('\n'));
-            } else {
-                setStatus('Preview generated', 'success', detail);
-            }
-            
+            showPreview(parsedStyle.style, parsedStyle.errors);
         } catch (error) {
             console.error('Generation error:', error);
             setStatus('Error generating preview', 'error');
-            showModal('Generation Error', error.message);
+            // WHY: the dialog showed only the exception, so style issues that
+            // were already found, and often caused it, were lost.
+            const found = parsedStyle.errors.length > 0
+                ? '\n\nStyle\n' + parsedStyle.errors.map(m => '- ' + m).join('\n')
+                : '';
+            showModal('Preview failed', 'The diagram could not be drawn: ' + error.message + found);
         }
-        
         Elements.btnGenerate.classList.remove('generating');
     }, 100);
+}
+
+/**
+ * @brief Parses the layout and nodes, renders the diagram and reports issues.
+ * @param {Object} style - Checked style from parseStyle().
+ * @param {Array} styleErrors - Style issues, appended to by rendering.
+ */
+function showPreview(style, styleErrors) {
+    console.assert(style !== null && typeof style === 'object', 'showPreview needs a style');
+    console.assert(Array.isArray(styleErrors), 'showPreview needs a style error list');
+    const layout = parseLayout(Elements.layoutInput.value);
+    const nodesData = parseNodes(Elements.nodesInput.value, layout);
+
+    AppState.styleConfig = style;
+    AppState.layoutTree = layout;
+    AppState.nodes = nodesData.nodes;
+    AppState.connections = nodesData.connections;
+
+    const svg = renderDiagram(style, layout, nodesData, styleErrors);
+    Elements.previewPlaceholder.style.display = 'none';
+    Elements.previewCanvas.style.display = 'block';
+    Elements.previewCanvas.innerHTML = svg;
+    Elements.btnExportPdf.disabled = false;
+    Elements.btnExportPng.disabled = false;
+    AppState.diagramGenerated = true;
+    zoomFit();
+
+    const levelErrors = LastDiagramPlan ? LastDiagramPlan.levels.errors : [];
+    if (typeof window !== 'undefined' && window.ORCA_VERIFY) {
+        window.OrcaDebug = verifyReport(styleErrors, nodesData.errors, LastDiagramPlan.levels);
+    }
+    reportIssues(nodesData.nodes.length + ' nodes, ' + nodesData.connections.length + ' connections', [
+        { title: 'Style', messages: styleErrors },
+        { title: 'Connections', messages: nodesData.errors },
+        { title: 'Routing', messages: levelErrors }
+    ]);
+}
+
+/**
+ * @brief Builds the debug summary the render harness reads.
+ * @param {Array} styleErrors - Style issues.
+ * @param {Array} errors - Connection issues.
+ * @param {Object} levels - Level decomposition from the last plan.
+ * @returns {Object} Errors plus the piece count per routing level.
+ */
+function verifyReport(styleErrors, errors, levels) {
+    console.assert(Array.isArray(errors), 'verifyReport needs connection errors');
+    console.assert(levels && levels.tree, 'verifyReport needs the level tree');
+    return {
+        styleErrors: styleErrors,
+        errors: errors,
+        levelErrors: levels.errors,
+        levels: Object.keys(levels.byLevel).map(id => ({
+            level: levels.tree.boxes[id] === levels.tree.root
+                ? 'root'
+                : (levels.tree.boxes[id].name || 'anon'),
+            kind: levels.tree.boxes[id].kind,
+            pieces: levels.byLevel[id].length
+        }))
+    };
 }
 
 // =============================================================================
