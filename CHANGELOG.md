@@ -2,8 +2,13 @@
 
 ## 2026-11-05
 
+### Added
+
+- `box-width: fill | fit`, default `fill`. `fit` keeps each box in a top to bottom stack to its own content width, centred, so diagrams take less room.
+
 ### Fixed
 
+- Boxes inside a stretched box sat left aligned with all the spare width on the right. They are now centred.
 - `font: 123` crashed the preview. A numeric font name is now kept as text.
 - A corner radius near half a node's width collapsed every port onto the node centre, so wires overlapped. The port inset is capped at a quarter of the node width.
 - `theme: toString` and similar built-in names reached every stroke as a colour. Only listed themes are used.

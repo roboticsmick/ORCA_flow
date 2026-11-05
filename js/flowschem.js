@@ -1706,13 +1706,18 @@ function getGutterPlan(node, childSizes, style) {
         contentWidth = cursor - LAYOUT_GUTTER + sideChannel;
     } else {
         const columnWidth = Math.max(...childSizes.map(s => s.width));
+        // `fill` stretches every box to the widest, `fit` keeps each box its
+        // own width centred in the column. The router's box takes the drawn
+        // width, so ports land on the edge that is actually drawn.
+        const fit = style['box-width'] === 'fit';
 
         contentRows = childSizes.map((size, i) => {
-            childOffsets.push(sideChannel);
-            childWidths.push(columnWidth);
+            const width = fit ? size.width : columnWidth;
+            childOffsets.push(sideChannel + (columnWidth - width) / 2);
+            childWidths.push(width);
             contentRowHeights.push(size.height);
             return {
-                nodes: [{ id: childIds[i], centreX: sideChannel + columnWidth / 2, width: columnWidth,
+                nodes: [{ id: childIds[i], centreX: sideChannel + columnWidth / 2, width: width,
                     passThrough: passThrough[i] }]
             };
         });
@@ -2355,77 +2360,90 @@ function renderDiagram(style, layout, nodesData, styleErrors) {
  * @returns {Object} { width, height } in pixels.
  */
 function calculateNodeContentSize(node, nodesData, style, parentName = null) {
-    // The same three values the placement pass uses. Written once, because a
-    // sizing pass and a placement pass that disagree leave wires outside the
-    // box they belong to.
-    const padding = LAYOUT_PADDING;
-    const labelHeight = SECTION_LABEL_HEIGHT;
-    const sectionPadding = SECTION_BOTTOM_PADDING;
-
-    // Calculate node dimensions from style
-    const fontSize = style['font-size'] || 14;
-    const hintSize = style['hint-size'] || 11;
-    const lineSpacing = 6;
-    const nodePadding = parsePaddingValues(style['node-padding']);
-    const nodeMinWidth = style['node-min-width'] || 120;
-    const channelSpacing = 15;
-    const rowSpacing = 20;
-
-    // Node height based on text content
-    const nodeHeightWithHint = nodePadding.top + fontSize + lineSpacing + hintSize + nodePadding.bottom;
-    const nodeHeightNoHint = nodePadding.top + fontSize + nodePadding.bottom;
-
     if (!node) return { width: 100, height: 60 };
+    console.assert(style, 'sizing needs a style');
 
-    if (node.type === 'segment') {
-        if (node.children && node.children.length > 0) {
-            // Nested children. The gutter plan owns the size, because a gutter
-            // has to be as wide as the tracks it carries.
-            const childSizes = node.children.map(child =>
-                calculateNodeContentSize(child, nodesData, style, node.name)
-            );
-            const gutter = getGutterPlan(node, childSizes, style);
+    // Post-order walk with an explicit stack, per P10 rule 1. A box's size
+    // needs its children's sizes first, so each box is visited twice: once to
+    // push its children, once to combine their sizes.
+    const sizes = new Map();
+    const stack = [{ node: node, parentName: parentName, expanded: false }];
+    let guard = 0;
 
-            return {
-                width: gutter.contentWidth + padding * 2,
-                height: gutter.contentHeight + labelHeight + padding
-            };
-        } else {
-            // Leaf segment - calculate based on nodes
-            let sectionKey = parentName ? `${parentName}:${node.name}` : node.name;
-            if (!nodesData.sections[sectionKey] && parentName) {
-                sectionKey = node.name;
-            }
+    while (stack.length > 0 && guard < MAX_LAYOUT_NODES * 2) {
+        guard++;
+        const item = stack.pop();
+        const current = item.node;
+        const children = current.children || [];
+        const nested = (current.type === 'segment' || current.type === 'container') && children.length > 0;
 
-            const section = nodesData.sections[sectionKey];
-            if (section) {
-                // The plan owns the content size, so the height reserved here
-                // is exactly the height the wires will occupy.
-                const bundle = getSectionPlan(nodesData, sectionKey, style, ActiveGapHeight);
-                if (bundle) {
-                    // WHY: placeLayout() insets every segment's content box by
-                    // LAYOUT_PADDING on both sides, but a leaf reserved only
-                    // its content width. Content came out 16px wider than its
-                    // box, sectionOriginX() clamped the centring offset to 0,
-                    // and the whole overflow landed on the right, so the
-                    // right-most node sat on the box edge.
-                    return { width: bundle.contentWidth + padding * 2, height: bundle.totalHeight };
-                }
-            }
-
-            // Default for empty sections
-            return { width: 150, height: labelHeight + nodeHeightNoHint + sectionPadding };
+        if (!nested) {
+            sizes.set(current, current.type === 'segment'
+                ? leafSegmentSize(current, nodesData, style, item.parentName)
+                : { width: 100, height: 60 });
+            continue;
         }
-    } else if (node.type === 'container') {
-        const childSizes = node.children.map(child =>
-            calculateNodeContentSize(child, nodesData, style, parentName)
-        );
-        const gutter = getGutterPlan(node, childSizes, style);
 
-        return { width: gutter.contentWidth, height: gutter.contentHeight };
+        // A segment names the section key its children resolve under; a
+        // container is an unnamed wrapper that passes its parent's name on.
+        const childParent = current.type === 'segment' ? current.name : item.parentName;
+        if (!item.expanded) {
+            stack.push({ node: current, parentName: item.parentName, expanded: true });
+            for (let i = children.length - 1; i >= 0; i--) {
+                stack.push({ node: children[i], parentName: childParent, expanded: false });
+            }
+            continue;
+        }
+
+        // The gutter plan owns the size, because a gutter has to be as wide
+        // as the tracks it carries.
+        const gutter = getGutterPlan(current, children.map(child => sizes.get(child)), style);
+        sizes.set(current, current.type === 'segment'
+            ? { width: gutter.contentWidth + LAYOUT_PADDING * 2,
+                height: gutter.contentHeight + SECTION_LABEL_HEIGHT + LAYOUT_PADDING }
+            : { width: gutter.contentWidth, height: gutter.contentHeight });
     }
 
-    return { width: 100, height: 60 };
+    console.assert(guard < MAX_LAYOUT_NODES * 2, 'content sizing hit its bound');
+    return sizes.get(node) || { width: 100, height: 60 };
+}
+
+/**
+ * @brief Content size of a segment with no child boxes, from its section plan.
+ *
+ * @param {Object} node - Leaf segment layout node.
+ * @param {Object} nodesData - Parsed nodes data with sections.
+ * @param {Object} style - Style configuration.
+ * @param {string|null} parentName - Enclosing segment name, or null.
+ * @returns {Object} { width, height } in pixels.
+ */
+function leafSegmentSize(node, nodesData, style, parentName) {
+    console.assert(node.type === 'segment', 'only a segment owns a section');
+    console.assert(nodesData && nodesData.sections, 'nodesData must be parsed');
+
+    let sectionKey = parentName ? `${parentName}:${node.name}` : node.name;
+    if (!nodesData.sections[sectionKey] && parentName) sectionKey = node.name;
+
+    if (nodesData.sections[sectionKey]) {
+        // The plan owns the content size, so the height reserved here is
+        // exactly the height the wires will occupy.
+        const bundle = getSectionPlan(nodesData, sectionKey, style, ActiveGapHeight);
+        if (bundle) {
+            // WHY: placeLayout() insets every segment's content box by
+            // LAYOUT_PADDING on both sides, but a leaf reserved only its
+            // content width. Content came out 16px wider than its box,
+            // sectionOriginX() clamped the centring offset to 0, and the whole
+            // overflow landed on the right, so the right-most node sat on the
+            // box edge.
+            return { width: bundle.contentWidth + LAYOUT_PADDING * 2, height: bundle.totalHeight };
+        }
+    }
+
+    // Default for empty sections: one node row without a hint.
+    const fontSize = style['font-size'] || 14;
+    const nodePadding = parsePaddingValues(style['node-padding']);
+    const nodeHeightNoHint = nodePadding.top + fontSize + nodePadding.bottom;
+    return { width: 150, height: SECTION_LABEL_HEIGHT + nodeHeightNoHint + SECTION_BOTTOM_PADDING };
 }
 
 /**
@@ -2506,7 +2524,7 @@ function attachSectionPlan(box, node, inner, style, nodesData, parentName) {
  * @param {number} colorIndex - Colour index of the first child.
  * @param {Object} nodesData - Parsed nodes and connections data.
  * @param {string} parentName - Enclosing segment name, or null.
- * @returns {Object} { items, gutter } where items are stack entries
+ * @returns {Object} { items, gutter, bounds } where items are stack entries
  *                   { node, box, colorIndex, parentName } in drawing order.
  */
 function placeLayoutChildren(node, children, inner, style, colorIndex, nodesData, parentName) {
@@ -2518,12 +2536,20 @@ function placeLayoutChildren(node, children, inner, style, colorIndex, nodesData
     const gutter = getGutterPlan(node, sizes, style);
     const placed = [];
 
+    // WHY: a leaf section was centred in its box by sectionOriginX(), but a
+    // container laid its children out from the box's left content edge. A
+    // parent column stretches every child to its widest sibling, so a narrower
+    // container's children sat left and all the slack landed on the right.
+    const originX = centredOriginX(gutter.contentWidth, inner);
+    const bounds = { x: originX, y: inner.y, width: Math.min(inner.width, gutter.contentWidth),
+        height: inner.height };
+
     children.forEach((child, i) => {
         const rowIdx = gutter.firstContentRow + (gutter.direction === 'row' ? 0 : i);
         placed.push({
             node: child,
             box: newPlacedBox(child,
-                inner.x + gutter.childOffsets[i],
+                originX + gutter.childOffsets[i],
                 inner.y + gutter.rowOffsets[rowIdx],
                 gutter.childWidths[i],
                 gutter.rowHeights[rowIdx]),
@@ -2532,7 +2558,7 @@ function placeLayoutChildren(node, children, inner, style, colorIndex, nodesData
         });
     });
 
-    return { items: placed, gutter: gutter };
+    return { items: placed, gutter: gutter, bounds: bounds };
 }
 
 /**
@@ -2596,7 +2622,7 @@ function placeLayout(layoutTree, origin, size, style, themeColors, nodesData) {
                 childColorIndex, nodesData, childParentName);
             box.children = laid.items.map(entry => entry.box);
             box.gutter = laid.gutter;
-            box.bounds = inner;
+            box.bounds = laid.bounds;
             for (let i = laid.items.length - 1; i >= 0; i--) stack.push(laid.items[i]);
             continue;
         }
@@ -2637,7 +2663,23 @@ function planOriginX(box) {
  */
 function sectionOriginX(bundle, bounds) {
     console.assert(bundle.contentWidth > 0, 'a section needs a width');
-    return bounds.x + Math.max(0, (bounds.width - bundle.contentWidth) / 2);
+    return centredOriginX(bundle.contentWidth, bounds);
+}
+
+/**
+ * @brief Page X at which content of a given width sits centred in a box.
+ *
+ * Sections and containers both centre through this, so a box's contents never
+ * sit left of where its wires were planned.
+ *
+ * @param {number} contentWidth - Width of the content in pixels.
+ * @param {Object} bounds - Content box { x, width }.
+ * @returns {number} Page X of the content's left edge.
+ */
+function centredOriginX(contentWidth, bounds) {
+    console.assert(contentWidth >= 0, 'content cannot have negative width');
+    console.assert(bounds && Number.isFinite(bounds.x), 'centring needs a box');
+    return bounds.x + Math.max(0, (bounds.width - contentWidth) / 2);
 }
 
 /**

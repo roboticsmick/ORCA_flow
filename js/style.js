@@ -54,11 +54,18 @@
         'node-fill': false,
         'node-text-color': '#333333',
         'hint-text-color': '#666666',
-        'corner-style': 'round'
+        'corner-style': 'round',
+        'box-width': 'fill'
     });
 
     /** Values `corner-style` accepts. */
     const CORNER_STYLES = Object.freeze(['round', 'square', 'chamfer']);
+
+    /** Values `box-width` accepts: stretch boxes in a column, or fit their content. */
+    const BOX_WIDTHS = Object.freeze(['fill', 'fit']);
+
+    /** Settings that must be one of a fixed list of words. */
+    const CHOICE_KEYS = Object.freeze({ 'corner-style': CORNER_STYLES, 'box-width': BOX_WIDTHS });
 
     /** Settings holding a colour that reaches the SVG `<style>` block. */
     const COLOR_KEYS = Object.freeze(['node-text-color', 'hint-text-color']);
@@ -251,8 +258,9 @@
         for (const key of BOOLEAN_KEYS) {
             if (typeof style[key] !== 'boolean') reject(style, errors, key, 'true or false');
         }
-        if (!CORNER_STYLES.includes(style['corner-style'])) {
-            reject(style, errors, 'corner-style', 'one of ' + CORNER_STYLES.join(', '));
+        for (const key of Object.keys(CHOICE_KEYS)) {
+            const choices = CHOICE_KEYS[key];
+            if (!choices.includes(style[key])) reject(style, errors, key, 'one of ' + choices.join(', '));
         }
     }
 
@@ -326,6 +334,7 @@
     return {
         DEFAULT_STYLE: DEFAULT_STYLE,
         CORNER_STYLES: CORNER_STYLES,
+        BOX_WIDTHS: BOX_WIDTHS,
         parseStyle: parseStyle,
         checkStyle: checkStyle,
         escapeXml: escapeXml,
