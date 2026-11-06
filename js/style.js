@@ -55,17 +55,22 @@
         'node-text-color': '#333333',
         'hint-text-color': '#666666',
         'corner-style': 'round',
-        'box-width': 'fill'
+        'box-width': 'fill',
+        'box-height': 'fill'
     });
 
     /** Values `corner-style` accepts. */
     const CORNER_STYLES = Object.freeze(['round', 'square', 'chamfer']);
 
-    /** Values `box-width` accepts: stretch boxes in a column, or fit their content. */
+    /** Values `box-width` and `box-height` accept: stretch boxes, or fit their content. */
     const BOX_WIDTHS = Object.freeze(['fill', 'fit']);
 
     /** Settings that must be one of a fixed list of words. */
-    const CHOICE_KEYS = Object.freeze({ 'corner-style': CORNER_STYLES, 'box-width': BOX_WIDTHS });
+    const CHOICE_KEYS = Object.freeze({
+        'corner-style': CORNER_STYLES,
+        'box-width': BOX_WIDTHS,
+        'box-height': BOX_WIDTHS
+    });
 
     /** Settings holding a colour that reaches the SVG `<style>` block. */
     const COLOR_KEYS = Object.freeze(['node-text-color', 'hint-text-color']);

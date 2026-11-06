@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-06
+
+### Added
+
+- `box-height: fill | fit`, default `fill`. `fit` keeps each box side by side to its own height, top aligned, and shrinks the gaps between boxes to the wires they carry.
+- The harness counts short sideways jogs and reports them with the wire lengths.
+
+### Fixed
+
+- Wires leaving a node through a box edge jogged sideways just below it, because the edge port aimed at the node's centre rather than the port the wire leaves by.
+
 ## 2026-11-05
 
 ### Added

@@ -1381,6 +1381,22 @@
         }
 
         /**
+         * @brief Pixel Y of a node's bottom edge.
+         *
+         * A node may be shorter than its row, as a box sized to its own
+         * content is, and then its wires must leave the edge that is drawn.
+         *
+         * @param {number} rowIdx - Zero based row index.
+         * @param {Object} node - The node, which may carry its own height.
+         * @returns {number} Pixel Y.
+         */
+        function bottomY(rowIdx, node) {
+            const band = rowHeight(rowIdx);
+            const own = node && node.height > 0 ? Math.min(node.height, band) : band;
+            return rowTops[rowIdx] + own;
+        }
+
+        /**
          * @brief Pixel Y of a horizontal track inside a gap.
          * @param {number} gapIdx - Index of the gap.
          * @param {number} track - Zero based track index.
@@ -1459,7 +1475,7 @@
                 farEnd: farEnd,
                 nearEnd: nearEnd,
                 y: trackY(run.gapIdx, run.track),
-                targetY: bus.edge === 'top' ? targetTop : targetTop + rowHeight(run.targetRow),
+                targetY: bus.edge === 'top' ? targetTop : bottomY(run.targetRow, bus.target),
                 edge: bus.edge,
                 farOwned: false,
                 nearOwned: false
@@ -1470,12 +1486,12 @@
             const dashed = net.dashed;
             const sourceTop = rowTops[net.sourceRow];
             const sourceY = net.sourceEdge === 'bottom'
-                ? sourceTop + rowHeight(net.sourceRow)
+                ? bottomY(net.sourceRow, net.source)
                 : sourceTop;
             const targetTop = rowTops[net.targetRow];
             const targetY = net.targetEdge === 'top'
                 ? targetTop
-                : targetTop + rowHeight(net.targetRow);
+                : bottomY(net.targetRow, net.target);
 
             // Walk the path: leave the source edge, alternate horizontal runs
             // and vertical crossings, then drop into the target edge.

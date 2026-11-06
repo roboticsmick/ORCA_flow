@@ -107,6 +107,7 @@ Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px
 | `hint-text-color` | hex colour | `#666666` | Hint line colour. |
 | `corner-style` | `round`, `square`, `chamfer` | `round` | Corner shape for nodes, boxes and wires. `chamfer` cuts each corner at 45 degrees by its radius. |
 | `box-width` | `fill`, `fit` | `fill` | Width of boxes stacked top to bottom. `fill` makes each as wide as the widest, `fit` keeps each to its own content, centred. |
+| `box-height` | `fill`, `fit` | `fill` | Height of boxes side by side. `fill` makes each as tall as the tallest, `fit` keeps each to its own content, top aligned, and shrinks the gaps between boxes to the wires they carry. |
 | `section-radius` | 0 to 10000 | `8` | Box corner radius in px. |
 | `section-border` | 0 to 10000 | `2` | Box outline width in px. |
 | `line-thickness` | 0 to 10000 | `2` | Wire width in px. |

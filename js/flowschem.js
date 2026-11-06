@@ -1685,6 +1685,7 @@ function getGutterPlan(node, childSizes, style) {
 
     const childOffsets = [];
     const childWidths = [];
+    const childHeights = [];
     const contentRowHeights = [];
     let contentRows = [];
     let contentWidth = 0;
@@ -1692,17 +1693,24 @@ function getGutterPlan(node, childSizes, style) {
     if (direction === 'row') {
         const boxes = [];
         let cursor = sideChannel;
+        const rowHeight = Math.max(...childSizes.map(s => s.height));
+        // `fill` stretches every box in the row to the tallest, `fit` keeps
+        // each its own height, top aligned. The router's box carries that
+        // height, so a wire leaves the bottom edge that is actually drawn.
+        const fitHeight = style['box-height'] === 'fit';
 
         childSizes.forEach((size, i) => {
+            const height = fitHeight ? size.height : rowHeight;
             childOffsets.push(cursor);
             childWidths.push(size.width);
+            childHeights.push(height);
             boxes.push({ id: childIds[i], centreX: cursor + size.width / 2, width: size.width,
-                passThrough: passThrough[i] });
+                height: height, passThrough: passThrough[i] });
             cursor += size.width + LAYOUT_GUTTER;
         });
 
         contentRows = [{ nodes: boxes }];
-        contentRowHeights.push(Math.max(...childSizes.map(s => s.height)));
+        contentRowHeights.push(rowHeight);
         contentWidth = cursor - LAYOUT_GUTTER + sideChannel;
     } else {
         const columnWidth = Math.max(...childSizes.map(s => s.width));
@@ -1715,6 +1723,7 @@ function getGutterPlan(node, childSizes, style) {
             const width = fit ? size.width : columnWidth;
             childOffsets.push(sideChannel + (columnWidth - width) / 2);
             childWidths.push(width);
+            childHeights.push(size.height);
             contentRowHeights.push(size.height);
             return {
                 nodes: [{ id: childIds[i], centreX: sideChannel + columnWidth / 2, width: width,
@@ -1784,6 +1793,7 @@ function getGutterPlan(node, childSizes, style) {
         sideChannel: sideChannel,
         childOffsets: childOffsets,
         childWidths: childWidths,
+        childHeights: childHeights,
         rowOffsets: rowOffsets,
         rowHeights: rowHeights,
         gapHeights: gapHeights,
@@ -2086,6 +2096,7 @@ function planDiagram(style, layout, nodesData) {
     let contentSize = { width: 400, height: 300 };
     let placement = null;
     let fitted = true;
+    let tightened = false;
 
     for (let pass = 0; pass < MAX_JOIN_PASSES; pass++) {
         if (pass > 0) resetSectionPlans();
@@ -2107,7 +2118,14 @@ function planDiagram(style, layout, nodesData) {
         // still fits the room reserved for it, the plan is final.
         const joined = joinBoundaries(placement);
         fitted = joined.fits;
-        if (joined.fits) break;
+        // WHY: gaps are reserved in the first round, when boundary ports are
+        // spread evenly and need many tracks. The aimed ports of the join need
+        // far fewer, but a fit only proves the room is enough, never that it
+        // is not too much, so `fit` sizes once more with the aimed ports.
+        const tighten = joined.fits && !tightened && style['box-height'] === 'fit'
+            && placementHasSlack(placement);
+        if (joined.fits && !tighten) break;
+        if (tighten) tightened = true;
         BoundaryHints = joined.hints;
         EndpointHints = joined.ends;
     }
@@ -2127,6 +2145,27 @@ function planDiagram(style, layout, nodesData) {
         placement: placement,
         themeColors: themeColors
     };
+}
+
+/**
+ * @brief Whether any gutter reserved more gap height than its final plan uses.
+ *
+ * @param {Object} placement - { root, order } after joinBoundaries().
+ * @returns {boolean} True when some gap could shrink.
+ */
+function placementHasSlack(placement) {
+    console.assert(placement && Array.isArray(placement.order), 'placementHasSlack needs a placement');
+    for (const box of placement.order) {
+        const gutter = box.gutter;
+        if (!gutter || !gutter.plan || !gutter.plan.gapTrackCounts) continue;
+        console.assert(Array.isArray(gutter.gapHeights), 'a gutter must reserve its gaps');
+        for (let g = 0; g < gutter.gapHeights.length; g++) {
+            const tracks = gutter.plan.gapTrackCounts[g] || 0;
+            const needed = tracks > 0 ? OrcaRouter.gapHeightForTracks(tracks, gutter.geometry) : 0;
+            if (gutter.gapHeights[g] > Math.max(LAYOUT_GUTTER, needed) + 0.5) return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -2552,7 +2591,7 @@ function placeLayoutChildren(node, children, inner, style, colorIndex, nodesData
                 originX + gutter.childOffsets[i],
                 inner.y + gutter.rowOffsets[rowIdx],
                 gutter.childWidths[i],
-                gutter.rowHeights[rowIdx]),
+                gutter.childHeights[i]),
             colorIndex: colorIndex + i,
             parentName: parentName
         });
@@ -2683,6 +2722,37 @@ function centredOriginX(contentWidth, bounds) {
 }
 
 /**
+ * @brief Page X of the node port each wire leaves or enters a section by.
+ *
+ * Only wires crossing the section's edge are listed, since they are the ones
+ * a level above has to line up with. One wire has a node port in each section
+ * it joins, so the map is keyed by box first: each port is listed under its
+ * own section and every box holding that section.
+ *
+ * @param {Object} placement - { root, order } from placeLayout().
+ * @returns {Object} Map from box level id to a map from net key to page X.
+ */
+function placedPortX(placement) {
+    console.assert(placement && Array.isArray(placement.order), 'placedPortX needs a placement');
+    const xs = {};
+    for (const box of placement.order) {
+        if (!box.level || !box.bundle || !box.bounds || !box.bundle.plan) continue;
+        const origin = sectionOriginX(box.bundle, box.bounds);
+        const chain = OrcaLevels._internal.ancestryOf(box.level);
+        for (const net of box.bundle.plan.nets) {
+            if (net.source.boundary === net.target.boundary) continue;
+            const x = origin + (net.source.boundary ? net.targetX : net.sourceX);
+            for (const holder of chain) {
+                if (!xs[holder.id]) xs[holder.id] = {};
+                xs[holder.id][net.id] = x;
+            }
+        }
+    }
+    console.assert(typeof xs === 'object', 'port lookup must be a map');
+    return xs;
+}
+
+/**
  * @brief Page X of every connection endpoint once the boxes are placed.
  *
  * A node sits where its section put it. Only node ends are aimed at, so box
@@ -2726,6 +2796,7 @@ function joinBoundaries(placement) {
     const hints = {};
     let fits = true;
     const endpointX = placedEndpointX(placement);
+    const portX = placedPortX(placement);
     const ends = {};
 
     // Inside a wrapper box, page X of each wire's port on the box it holds.
@@ -2743,6 +2814,12 @@ function joinBoundaries(placement) {
             // land where it leaves the box inside, or it jogs in the wrapper.
             const through = throughX[boxId] && throughX[boxId][key];
             if (Number.isFinite(through)) return through - local;
+            // WHY: aiming at the node's centre jogged every wire of a group.
+            // The node spreads its own ports evenly, other wires included, so
+            // a group of four out of Teensy's five left half a pitch right of
+            // the centre the level above had lined them up on.
+            const port = portX[boxId] && portX[boxId][key];
+            if (Number.isFinite(port)) return port - local;
             return nodeId !== null && Number.isFinite(endpointX[nodeId]) ? endpointX[nodeId] - local : null;
         };
     }
