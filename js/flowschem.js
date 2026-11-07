@@ -381,6 +381,32 @@ function parseNameAndColor(str) {
 /** Largest number of layout tree nodes walked when collecting the layout scope. */
 const MAX_LAYOUT_NODES = 4096;
 
+/** Highest row number a section header may use, well inside the router's 512-row cap with room for boundary rows. */
+const MAX_SECTION_ROWS = 256;
+
+/** Most connections one diagram may declare, the router's per-level net cap. */
+const MAX_DIAGRAM_CONNECTIONS = 4096;
+
+/**
+ * @brief Checks one more connection fits under the diagram's cap.
+ *
+ * WHY: the router asserts its net cap, which throws, so a long `.flow` file
+ * crashed the preview instead of reporting what was dropped.
+ *
+ * @param {Object} result - Parse result being built, with connections and errors.
+ * @returns {boolean} True when the connection may be added.
+ */
+function admitConnection(result) {
+    console.assert(Array.isArray(result.connections), 'admitConnection needs a parse result');
+    if (result.connections.length < MAX_DIAGRAM_CONNECTIONS) return true;
+    if (!result.connectionCapReported) {
+        result.connectionCapReported = true;
+        result.errors.push('The diagram has more than ' + MAX_DIAGRAM_CONNECTIONS
+            + ' connections, so the rest were skipped.');
+    }
+    return false;
+}
+
 /**
  * @brief Collects the section keys and container names the layout places.
  *
@@ -551,8 +577,10 @@ function parseNodes(input, layoutTree) {
     const result = {
         nodes: [],
         connections: [],
-        sections: {},
-        nodeMap: {},  // Quick lookup by ID
+        // WHY: a section or node named `__proto__` or `constructor` hit the
+        // prototype of a plain object, which threw or merged two sections.
+        sections: Object.create(null),
+        nodeMap: Object.create(null),  // Quick lookup by ID
         errors: []
     };
 
@@ -583,7 +611,17 @@ function parseNodes(input, layoutTree) {
         if (sectionMatch) {
             currentParent = sectionMatch[1] || null;
             currentSection = sectionMatch[2];
-            currentRow = parseInt(sectionMatch[3]);
+            currentRow = parseInt(sectionMatch[3], 10);
+
+            // WHY: rows are walked from 1 to the highest number, so a header
+            // such as `a-999999999` looped that many times before any limit
+            // was checked. Reject it here, where the number is read.
+            if (!(currentRow >= 1 && currentRow <= MAX_SECTION_ROWS)) {
+                result.errors.push("Row '" + trimmed + "' is out of range. Rows are numbered 1 to "
+                    + MAX_SECTION_ROWS + ', so its lines were skipped.');
+                currentSection = null;
+                continue;
+            }
 
             // Create full section key with parent if specified
             const sectionKey = currentParent ? `${currentParent}:${currentSection}` : currentSection;
@@ -679,6 +717,7 @@ function parseNodes(input, layoutTree) {
                         dashed: parsed.dashed,
                         colour: target.colour
                     };
+                    if (!admitConnection(result)) continue;
                     result.connections.push(connection);
 
                     // Track connections on nodes (based on actual direction)
@@ -807,6 +846,7 @@ function resolvePendingLinks(result, pendingLinks, scope) {
                 fromKind: from.kind,
                 toKind: to.kind
             };
+            if (!admitConnection(result)) continue;
             result.connections.push(connection);
 
             if (from.kind === 'node' && result.nodeMap[from.id]) {
@@ -1269,29 +1309,33 @@ function getSectionPlan(nodesData, sectionKey, style, uniformGapHeight = 0) {
 }
 
 /**
- * @brief Splits every connection into the pieces each routing level must draw.
+ * @brief Trunk id of a connection, or null when it cannot join a trunk.
  *
- * A connection whose endpoints sit in one section is left alone, because
- * planSection() already routes it. Everything else is decomposed against the
- * layout tree, which yields one piece per container boundary the wire crosses.
+ * Only a plain one-way wire has a single target to merge toward. Wires to one
+ * target with different dash styles must stay apart, so the style is part of
+ * the id.
  *
- * This is the plan phase's first step and needs no geometry, so it runs before
- * anything is sized or placed.
- *
- * @pre nodesData must have been parsed with the same layout tree.
- *
- * @param {Object} layoutTree - Parsed layout tree, may be null.
- * @param {Object} nodesData - Parsed nodes data.
- * @returns {Object} { tree, byLevel, errors } where byLevel maps a box id to
- *                   the pieces that level routes.
+ * @param {Object} conn - Parsed connection.
+ * @returns {string|null} Trunk id, or null.
  */
-function planLevels(layoutTree, nodesData) {
-    const sectionKeys = Object.keys(nodesData.sections);
-    const tree = OrcaLevels.buildLevelTree(layoutTree, sectionKeys);
-    const byLevel = {};
-    const errors = [];
+function trunkIdOf(conn) {
+    console.assert(conn && typeof conn === 'object', 'trunkIdOf needs a connection');
+    if (conn.type !== 'to') return null;
+    return (conn.toKind || 'node') + ':' + conn.to + '|' + (conn.dashed ? 'dashed' : 'solid');
+}
 
-    if (!tree.root) return { tree: tree, byLevel: byLevel, errors: errors };
+/**
+ * @brief Splits every connection that leaves its own section into pieces.
+ *
+ * @param {Object} nodesData - Parsed nodes data.
+ * @param {Object} tree - Level tree from buildLevelTree().
+ * @returns {Object} { decomposed, errors } where decomposed holds
+ *                   { key, trunk, pieces, connection } per crossing wire.
+ */
+function decomposeCrossLevel(nodesData, tree) {
+    console.assert(tree && tree.root, 'decomposeCrossLevel needs a level tree');
+    const decomposed = [];
+    const errors = [];
 
     /**
      * @brief Describes one connection end the way decomposeNet expects.
@@ -1322,30 +1366,91 @@ function planLevels(layoutTree, nodesData) {
             errors.push(result.error);
             return;
         }
-        for (const piece of result.pieces) {
+        decomposed.push({
+            // One key per connection, shared by all of its pieces, which
+            // is how a port on one side of a box edge finds the other.
+            key: 'n' + connIndex,
+            trunk: trunkIdOf(conn),
+            pieces: result.pieces,
+            connection: conn
+        });
+    });
+    return { decomposed: decomposed, errors: errors };
+}
+
+/**
+ * @brief Splits every connection into the pieces each routing level must draw.
+ *
+ * A connection whose endpoints sit in one section is left alone, because
+ * planSection() already routes it. Everything else is decomposed against the
+ * layout tree, which yields one piece per container boundary the wire crosses.
+ *
+ * This is the plan phase's first step and needs no geometry, so it runs before
+ * anything is sized or placed.
+ *
+ * @pre nodesData must have been parsed with the same layout tree.
+ *
+ * @param {Object} layoutTree - Parsed layout tree, may be null.
+ * @param {Object} nodesData - Parsed nodes data.
+ * @returns {Object} { tree, byLevel, errors } where byLevel maps a box id to
+ *                   the pieces that level routes.
+ */
+function planLevels(layoutTree, nodesData) {
+    const sectionKeys = Object.keys(nodesData.sections);
+    const tree = OrcaLevels.buildLevelTree(layoutTree, sectionKeys);
+    const byLevel = Object.create(null);
+
+    if (!tree.root) return { tree: tree, byLevel: byLevel, errors: [] };
+
+    const { decomposed, errors } = decomposeCrossLevel(nodesData, tree);
+    const merged = OrcaLevels.mergeTrunks(decomposed);
+    merged.nets.forEach((net, i) => {
+        const conn = decomposed[i].connection;
+        for (const piece of net.pieces) {
             if (!byLevel[piece.levelId]) byLevel[piece.levelId] = [];
             byLevel[piece.levelId].push({
-                // One key per connection, shared by all of its pieces, which
-                // is how a port on one side of a box edge finds the other.
-                key: 'n' + connIndex,
+                key: net.key,
+                // Set on a trunk piece: the net whose boundary port it shares.
+                portKey: piece.portKey || null,
                 connection: conn,
                 from: piece.from,
                 to: piece.to,
-                pieceCount: result.pieces.length
+                pieceCount: net.pieces.length
             });
         }
     });
+    const keyToIndex = {};
+    decomposed.forEach(net => { keyToIndex[net.key] = net.connection.index; });
+    const trunkLinks = merged.merges.map(([member, owner]) => [keyToIndex[member], keyToIndex[owner]]);
 
     // Net keys per level, so asking whether a wire carries on inside a box
     // is a lookup rather than a scan.
-    const keysByLevel = {};
+    const keysByLevel = Object.create(null);
     for (const levelId in byLevel) {
         keysByLevel[levelId] = new Set(byLevel[levelId].map(piece => piece.key));
     }
 
-    const levels = { tree: tree, byLevel: byLevel, keysByLevel: keysByLevel, errors: errors, sides: {} };
+    const levels = {
+        tree: tree, byLevel: byLevel, keysByLevel: keysByLevel, errors: errors, sides: {},
+        // Connection index pairs drawn as one trunk, for trace colouring.
+        trunkLinks: trunkLinks
+    };
     levels.sides = planBoundarySides(levels);
     return levels;
+}
+
+/**
+ * @brief Net key a piece's boundary end is filed under.
+ *
+ * A trunk member shares its owner's boundary port, so its boundary side, row
+ * node and port X are all the owner's.
+ *
+ * @param {Object} piece - Piece from planLevels().
+ * @returns {string} The owner's key for a trunk member, else the piece's own.
+ */
+function boundaryKeyOf(piece) {
+    console.assert(piece && typeof piece.key === 'string', 'a piece needs a key');
+    return piece.portKey || piece.key;
 }
 
 /**
@@ -1396,8 +1501,8 @@ function planBoundarySides(levels) {
         }
 
         for (const piece of levels.byLevel[box.id] || []) {
-            const fromRow = endRow(piece.from, piece.key);
-            const toRow = endRow(piece.to, piece.key);
+            const fromRow = endRow(piece.from, boundaryKeyOf(piece));
+            const toRow = endRow(piece.to, boundaryKeyOf(piece));
             if (fromRow === undefined || toRow === undefined) continue;
 
             // The same rule OrcaRouter's decomposeNet applies to row indices.
@@ -1430,9 +1535,14 @@ function boundaryKeys(levelId) {
     if (!ActiveLevels || !levelId) return keys;
 
     const own = ActiveLevels.sides[levelId] || {};
+    const seen = new Set();
     for (const piece of ActiveLevels.byLevel[levelId] || []) {
         if (piece.from.kind !== 'boundary' && piece.to.kind !== 'boundary') continue;
-        keys[own[piece.key] === 'top' ? 'top' : 'bottom'].push(piece.key);
+        // A trunk's members share one port, so the edge lists it once.
+        const key = boundaryKeyOf(piece);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        keys[own[key] === 'top' ? 'top' : 'bottom'].push(key);
     }
     return keys;
 }
@@ -1524,7 +1634,9 @@ function continuesInside(end, key) {
  * @param {Function} accept - Returns true for a piece end id this level holds.
  * @param {Function} [prefer] - (boxId, nodeId, key) to the X in this level's
  *                              space a wire carrying on inside child box boxId
- *                              aims its port at, or null.
+ *                              aims its port at, or null. It may carry
+ *                              prefer.order(boxId, key), an X that only sorts
+ *                              a port with no aim among its neighbours.
  * @returns {Array} Connections keyed by net key.
  */
 function boundaryConnections(levelId, ids, accept, prefer) {
@@ -1544,8 +1656,8 @@ function boundaryConnections(levelId, ids, accept, prefer) {
 
     const connections = [];
     for (const piece of ActiveLevels.byLevel[levelId] || []) {
-        const from = endId(piece.from, piece.key);
-        const to = endId(piece.to, piece.key);
+        const from = endId(piece.from, boundaryKeyOf(piece));
+        const to = endId(piece.to, boundaryKeyOf(piece));
         if (!from || !to) continue;
 
         const continuesFrom = continuesInside(piece.from, piece.key);
@@ -1557,6 +1669,8 @@ function boundaryConnections(levelId, ids, accept, prefer) {
             type: piece.connection.type,
             dashed: !!piece.connection.dashed,
             traceIndex: piece.connection.index,
+            // Wires sharing one trunk meet on one boundary port as a bus.
+            trunk: piece.portKey,
             continuesFrom: continuesFrom,
             continuesTo: continuesTo,
             // Pieces keep the connection's direction, so the from end of a
@@ -1568,7 +1682,9 @@ function boundaryConnections(levelId, ids, accept, prefer) {
                 : null,
             targetPreferX: continuesTo && prefer
                 ? prefer(piece.to.id, piece.connection.toKind === 'section' ? null : piece.connection.to, piece.key)
-                : null
+                : null,
+            sourceOrderX: continuesFrom && prefer && prefer.order ? prefer.order(piece.from.id, piece.key) : null,
+            targetOrderX: continuesTo && prefer && prefer.order ? prefer.order(piece.to.id, piece.key) : null
         });
     }
     return connections;
@@ -1669,8 +1785,8 @@ function getGutterPlan(node, childSizes, style) {
         }
 
         for (const piece of ActiveLevels.byLevel[cacheKey] || []) {
-            const a = rowOfEnd(piece.from, piece.key);
-            const b = rowOfEnd(piece.to, piece.key);
+            const a = rowOfEnd(piece.from, boundaryKeyOf(piece));
+            const b = rowOfEnd(piece.to, boundaryKeyOf(piece));
             if (a !== undefined && b !== undefined && Math.abs(a - b) > 1) skipping++;
         }
         if (skipping > 0) {
@@ -1825,33 +1941,37 @@ function getGutterPlan(node, childSizes, style) {
  */
 function calculateUniformGapHeight(layoutTree, nodesData, style) {
     let tallest = 0;
+    if (!layoutTree) return tallest;
 
-    /**
-     * @brief Visits one layout node, recording the gap height it needs.
-     * @param {Object} node - Layout tree node.
-     * @param {string} parentName - Enclosing segment name, for section lookup.
-     * @returns {void}
-     */
-    function visit(node, parentName) {
-        if (!node) return;
+    // Explicit stack rather than recursion, per P10 rule 1. Children go on in
+    // reverse so sections are still planned in reading order.
+    const stack = [{ node: layoutTree, parentName: null }];
+    let guard = 0;
+    while (stack.length > 0 && guard < MAX_LAYOUT_NODES) {
+        guard++;
+        const item = stack.pop();
+        const node = item.node;
+        if (!node) continue;
 
         if (node.children && node.children.length > 0) {
-            const childParent = node.type === 'segment' ? node.name : parentName;
-            for (const child of node.children) visit(child, childParent);
-            return;
+            const childParent = node.type === 'segment' ? node.name : item.parentName;
+            for (let i = node.children.length - 1; i >= 0; i--) {
+                stack.push({ node: node.children[i], parentName: childParent });
+            }
+            continue;
         }
 
-        if (node.type !== 'segment') return;
+        if (node.type !== 'segment') continue;
 
+        const parentName = item.parentName;
         let sectionKey = parentName ? parentName + ':' + node.name : node.name;
         if (!nodesData.sections[sectionKey] && parentName) sectionKey = node.name;
-        if (!nodesData.sections[sectionKey]) return;
+        if (!nodesData.sections[sectionKey]) continue;
 
         const bundle = getSectionPlan(nodesData, sectionKey, style, 0);
         if (bundle) tallest = Math.max(tallest, bundle.gapHeight);
     }
-
-    visit(layoutTree, null);
+    console.assert(guard < MAX_LAYOUT_NODES, 'gap height walk hit its bound');
     return tallest;
 }
 
@@ -2219,7 +2339,9 @@ function planTraceColours(style, placement, nodesData, styleErrors) {
     }
     if (!palette && Object.keys(overrides).length === 0) return null;
 
-    const links = [];
+    // A trunk draws its members' later pieces as one wire, so they share a
+    // colour even where the router could not draw the merge as a bus.
+    const links = ((ActiveLevels && ActiveLevels.trunkLinks) || []).slice();
     for (const box of (placement && placement.order) || []) {
         const plans = [box.bundle && box.bundle.plan, box.gutter && box.gutter.plan];
         for (const plan of plans) {
@@ -2763,7 +2885,8 @@ function placedPortX(placement) {
  */
 function placedEndpointX(placement) {
     console.assert(placement && Array.isArray(placement.order), 'placedEndpointX needs a placement');
-    const xs = {};
+    // A null-prototype map, so a node id of __proto__ is an ordinary entry.
+    const xs = Object.create(null);
     for (const box of placement.order) {
         if (!box.bundle || !box.bounds) continue;
         const origin = sectionOriginX(box.bundle, box.bounds);
@@ -2772,6 +2895,114 @@ function placedEndpointX(placement) {
         }
     }
     return xs;
+}
+
+/**
+ * @brief Page X where each wire crossing a container's edge meets the first
+ *        box inside it, from that container's current plan.
+ *
+ * @param {Object} placement - { root, order } from placeLayout().
+ * @returns {Object} Map from level id to a map from net key to page X.
+ */
+function buildInnerPortX(placement) {
+    console.assert(placement && Array.isArray(placement.order), 'buildInnerPortX needs a placement');
+    const innerPortX = Object.create(null);
+    for (const box of placement.order) {
+        if (!box.level || !box.gutter || !box.gutter.plan) continue;
+        const origin = planOriginX(box);
+        const own = innerPortX[box.level.id] = Object.create(null);
+        for (const net of box.gutter.plan.nets) {
+            if (net.source.boundary === net.target.boundary) continue;
+            // WHY: every trunk member wrote the owner's key from its own
+            // source, so whichever was declared last picked the trunk's sort
+            // slot. A trunk meets the level above on its owner's key, so only
+            // the owner writes it.
+            if (net.target.boundary && net.trunk && net.trunk !== net.id) continue;
+            own[net.id] = origin + (net.source.boundary ? net.targetX : net.sourceX);
+        }
+    }
+    return innerPortX;
+}
+
+/**
+ * @brief Builds the port aim lookup for one level.
+ *
+ * @param {number} local - Page X of the level's local zero.
+ * @param {Object} maps - { throughX, portX, endpointX, innerPortX } page X
+ *                        lookups from joinBoundaries().
+ * @returns {Function} (boxId, nodeId, key) to local X, or null, carrying
+ *                     order(boxId, key) to an X that only sorts a port.
+ */
+function makePreferAt(local, maps) {
+    console.assert(Number.isFinite(local) && maps, 'makePreferAt needs an origin and lookups');
+    const prefer = (boxId, nodeId, key) => {
+        // WHY: a wrapper is never drawn, so a wire crossing its edge must
+        // land where it leaves the box inside, or it jogs in the wrapper.
+        const through = maps.throughX[boxId] && maps.throughX[boxId][key];
+        if (Number.isFinite(through)) return through - local;
+        // WHY: aiming at the node's centre jogged every wire of a group.
+        // The node spreads its own ports evenly, other wires included, so
+        // a group of four out of Teensy's five left half a pitch right of
+        // the centre the level above had lined them up on.
+        const port = maps.portX[boxId] && maps.portX[boxId][key];
+        if (Number.isFinite(port)) return port - local;
+        return nodeId !== null && Number.isFinite(maps.endpointX[nodeId]) ? maps.endpointX[nodeId] - local : null;
+    };
+    // WHY: a wire ending on a box inside the child, such as a section
+    // to section power line, has no node to aim at, so it was sorted by
+    // its far end. That slotted it between the ESC wires on AFT's edge,
+    // the even group there no longer matched PROPULSION's inside it, and
+    // all four ESC wires jogged. Where it carries on inside the child
+    // gives it a place in the order without pulling the group.
+    prefer.order = (boxId, key) => {
+        const x = maps.innerPortX[boxId] && maps.innerPortX[boxId][key];
+        return Number.isFinite(x) ? x - local : null;
+    };
+    return prefer;
+}
+
+/**
+ * @brief Page X of each wire's port on the box a wrapper holds.
+ *
+ * @param {Object} box - Wrapper box with a gutter plan.
+ * @param {Object} hints - Boundary port hints per level id.
+ * @param {Function} preferAt - Local origin to a port aim lookup.
+ * @returns {Object} Map from net key to page X.
+ */
+function wrapperInnerX(box, hints, preferAt) {
+    console.assert(box && box.gutter && box.gutter.plan, 'wrapperInnerX needs a planned wrapper');
+    const local = planOriginX(box);
+    const plan = box.gutter.replan(hints[box.level.id] || {}, preferAt(local));
+    const inner = Object.create(null);
+    for (const net of plan.nets) {
+        if (!net.source.boundary) inner[net.id] = local + net.sourceX;
+        if (!net.target.boundary) inner[net.id] = local + net.targetX;
+    }
+    return inner;
+}
+
+/**
+ * @brief Hands each wire's crossing point down to the child box it enters.
+ *
+ * @param {Object} box - Container box with its final gutter plan.
+ * @param {number} local - Page X of the container's local zero.
+ * @param {Object} hints - Boundary port hints per level id, mutated.
+ * @returns {void}
+ */
+function handHintsDown(box, local, hints) {
+    console.assert(box && box.gutter && box.gutter.plan, 'handHintsDown needs a planned container');
+    const childById = Object.create(null);
+    for (const child of box.children) {
+        if (child.level) childById[child.level.id] = child;
+    }
+    for (const net of box.gutter.plan.nets) {
+        for (const [nodeId, x] of [[net.from, net.sourceX], [net.to, net.targetX]]) {
+            const child = childById[nodeId];
+            if (!child || !child.bounds) continue;
+            if (!hints[nodeId]) hints[nodeId] = Object.create(null);
+            hints[nodeId][net.id] = local + x - planOriginX(child);
+        }
+    }
 }
 
 /**
@@ -2793,7 +3024,7 @@ function placedEndpointX(placement) {
 function joinBoundaries(placement) {
     console.assert(placement && Array.isArray(placement.order), 'joinBoundaries needs a placement');
 
-    const hints = {};
+    const hints = Object.create(null);
     let fits = true;
     const endpointX = placedEndpointX(placement);
     const portX = placedPortX(placement);
@@ -2801,39 +3032,13 @@ function joinBoundaries(placement) {
 
     // Inside a wrapper box, page X of each wire's port on the box it holds.
     // Wrappers go children first, so a wrapper inside a wrapper is ready.
-    const throughX = {};
-
-    /**
-     * @brief Builds the port aim lookup for one level.
-     * @param {number} local - Page X of the level's local zero.
-     * @returns {Function} (boxId, nodeId, key) to local X, or null.
-     */
-    function preferAt(local) {
-        return (boxId, nodeId, key) => {
-            // WHY: a wrapper is never drawn, so a wire crossing its edge must
-            // land where it leaves the box inside, or it jogs in the wrapper.
-            const through = throughX[boxId] && throughX[boxId][key];
-            if (Number.isFinite(through)) return through - local;
-            // WHY: aiming at the node's centre jogged every wire of a group.
-            // The node spreads its own ports evenly, other wires included, so
-            // a group of four out of Teensy's five left half a pitch right of
-            // the centre the level above had lined them up on.
-            const port = portX[boxId] && portX[boxId][key];
-            if (Number.isFinite(port)) return port - local;
-            return nodeId !== null && Number.isFinite(endpointX[nodeId]) ? endpointX[nodeId] - local : null;
-        };
-    }
+    const throughX = Object.create(null);
+    const innerPortX = buildInnerPortX(placement);
+    const preferAt = local => makePreferAt(local, { throughX, portX, endpointX, innerPortX });
 
     for (const box of placement.order.slice().reverse()) {
         if (!box.level || box.name || !box.gutter || !box.gutter.plan) continue;
-        const local = planOriginX(box);
-        const plan = box.gutter.replan(hints[box.level.id] || {}, preferAt(local));
-        const inner = {};
-        for (const net of plan.nets) {
-            if (!net.source.boundary) inner[net.id] = local + net.sourceX;
-            if (!net.target.boundary) inner[net.id] = local + net.targetX;
-        }
-        throughX[box.level.id] = inner;
+        throughX[box.level.id] = wrapperInnerX(box, hints, preferAt);
     }
 
     for (const box of placement.order) {
@@ -2867,19 +3072,7 @@ function joinBoundaries(placement) {
             box.gutter = Object.assign({}, box.gutter, { plan: plan });
         }
 
-        // Hand each wire's crossing point down to the child box it enters.
-        const childById = {};
-        for (const child of box.children) {
-            if (child.level) childById[child.level.id] = child;
-        }
-        for (const net of box.gutter.plan.nets) {
-            for (const [nodeId, x] of [[net.from, net.sourceX], [net.to, net.targetX]]) {
-                const child = childById[nodeId];
-                if (!child || !child.bounds) continue;
-                if (!hints[nodeId]) hints[nodeId] = {};
-                hints[nodeId][net.id] = local + x - planOriginX(child);
-            }
-        }
+        handHintsDown(box, local, hints);
     }
 
     return { hints: hints, ends: ends, fits: fits };
@@ -2900,16 +3093,17 @@ function joinBoundaries(placement) {
 function stretchBoundaryEnds(emitted, plan, edges) {
     console.assert(edges && typeof edges.top === 'number', 'edges must give a top');
 
-    const byId = {};
-    for (const net of plan.nets) byId[net.id] = net;
+    const byId = planNetLookup(plan);
 
     for (const line of emitted.polylines) {
         const net = byId[line.netId];
         if (!net) continue;
-        if (net.source.boundary) {
+        if (net.source.boundary && !line.netId.startsWith('bus:')) {
             line.points[0].y = net.sourceRow === 0 ? edges.top : edges.bottom;
         }
-        if (net.target.boundary) {
+        // WHY: a trunk member that stops on its bus bar ends mid-gap. Moving
+        // that end to the box edge drew a stray stub down past the bar.
+        if (net.target.boundary && line.endsAtTarget !== false) {
             line.points[line.points.length - 1].y = net.targetRow === 0 ? edges.top : edges.bottom;
         }
     }
@@ -2931,6 +3125,25 @@ function stretchBoundaryEnds(emitted, plan, edges) {
 }
 
 /**
+ * @brief Maps each net id, and each bus as 'bus:<key>', to a net of the plan.
+ *
+ * A bus stands in for its first member, which shares the target with the rest.
+ *
+ * @param {Object} plan - Result of planSection().
+ * @returns {Object} Map of polyline net id to net.
+ */
+function planNetLookup(plan) {
+    console.assert(plan && Array.isArray(plan.nets), 'planNetLookup needs a plan');
+    const byId = {};
+    for (const net of plan.nets) byId[net.id] = net;
+    for (const key in plan.buses || {}) {
+        const members = plan.buses[key].members;
+        if (members.length > 0) byId['bus:' + key] = members[0];
+    }
+    return byId;
+}
+
+/**
  * @brief Records where a level's wires meet box edges, for the join check.
  *
  * Every wire that ends on a boundary row has to meet a wire the level above
@@ -2947,16 +3160,18 @@ function recordJoinEnds(emitted, plan, originX, continues) {
     if (typeof window === 'undefined' || !window.ORCA_VERIFY || !window.OrcaCheck) return;
     if (!window.OrcaCheck.joinEnds) window.OrcaCheck.joinEnds = { boundary: [], box: [] };
 
-    const byId = {};
-    for (const net of plan.nets) byId[net.id] = net;
+    const byId = planNetLookup(plan);
 
     for (const line of emitted.polylines) {
         const net = byId[line.netId];
         if (!net) continue;
+        const isBus = line.netId.startsWith('bus:');
         const first = line.points[0];
         const last = line.points[line.points.length - 1];
-        for (const [node, point] of [[net.source, first], [net.target, last]]) {
-            const end = { key: net.id, x: originX + point.x, y: point.y };
+        for (const [node, point, isEnd] of [[net.source, first, !isBus], [net.target, last, line.endsAtTarget !== false]]) {
+            if (!isEnd) continue;
+            // A trunk meets the level above on its owner's key.
+            const end = { key: (node.boundary && net.trunk) || net.id, x: originX + point.x, y: point.y };
             if (node.boundary) window.OrcaCheck.joinEnds.boundary.push(end);
             else if (continues(node.id, net.id)) window.OrcaCheck.joinEnds.box.push(end);
         }

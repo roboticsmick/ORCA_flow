@@ -87,9 +87,11 @@
     function buildLevelTree(layoutTree, sectionKeys) {
         console.assert(Array.isArray(sectionKeys), 'sectionKeys must be an array');
 
-        const boxes = {};
-        const bySection = {};
-        const byName = {};
+        // WHY: a plain object resolves a segment named `constructor` or
+        // `toString` to a built-in function, so the endpoint misresolved.
+        const boxes = Object.create(null);
+        const bySection = Object.create(null);
+        const byName = Object.create(null);
         const byNode = new Map();
         if (!layoutTree) {
             return {
@@ -235,8 +237,8 @@
      * @param {Object} from - Source endpoint { kind, id, sectionKey }.
      * @param {Object} to - Target endpoint { kind, id, sectionKey }.
      * @param {Object} tree - Output of buildLevelTree().
-     * @returns {Object} { pieces, error } where a piece is
-     *                   { levelId, from, to }. An end is { kind, id } with
+     * @returns {Object} { pieces, error } where pieces run in path order,
+     *                   source to target, and a piece is { levelId, from, to }. An end is { kind, id } with
      *                   kind 'node' for the original node inside its section,
      *                   'box' for a child box at that level, or 'boundary' for
      *                   a port on the level's own outer edge.
@@ -321,16 +323,89 @@
         }
 
         const endA = climb(a, upA, false);
+        const sourceCount = pieces.length;
         const endB = climb(b, upB, true);
 
-        pieces.push({ levelId: lca.id, from: endA, to: endB });
+        // Path order, source to target: the source climb, the shared level,
+        // then the target climb, which climb() built from the target outward.
+        const inward = pieces.slice(sourceCount).reverse();
+        const ordered = pieces.slice(0, sourceCount);
+        ordered.push({ levelId: lca.id, from: endA, to: endB });
+        for (const piece of inward) ordered.push(piece);
 
-        return { pieces: pieces, error: null };
+        return { pieces: ordered, error: null };
+    }
+
+    // =========================================================================
+    // 4. TRUNK MERGING
+    // =========================================================================
+
+    /**
+     * @brief Merges wires bound for one target into one trunk as early as possible.
+     *
+     * In a tree there is one path from a box edge to a given target. So once
+     * two wires to the same target leave the same box through its edge, the
+     * rest of their paths are identical, and drawing both only stacks two
+     * lines side by side. From the first such edge on, the later wire is
+     * dropped and its last kept piece is marked to share the earlier wire's
+     * boundary port, which the router then draws as one merge bus.
+     *
+     * Only an edge the wire leaves by counts. Two wires entering one child
+     * box are left alone, because their ports there aim at different nodes.
+     *
+     * @pre Each net's pieces must be in path order, as decomposeNet() returns.
+     *
+     * @param {Array} nets - { key, trunk, pieces } per connection, in order.
+     *                       trunk is null for a wire that may never merge,
+     *                       such as a bidirectional one, else a string that
+     *                       is equal for wires of one target and dash style.
+     * @returns {Object} { nets, merges } where nets keeps the input order with
+     *                   each piece copied and dropped pieces removed, a merged
+     *                   piece carries portKey naming the net whose boundary
+     *                   port it shares, and merges lists [memberKey, ownerKey].
+     */
+    function mergeTrunks(nets) {
+        console.assert(Array.isArray(nets), 'mergeTrunks needs a list of nets');
+        const reached = {};     // trunk -> "levelId|boundaryId" -> owner piece
+        const merges = [];
+        const out = [];
+
+        for (const net of nets) {
+            const kept = [];
+            const spots = net.trunk ? (reached[net.trunk] = reached[net.trunk] || {}) : null;
+            let pieceGuard = 0;
+
+            for (const piece of net.pieces) {
+                pieceGuard++;
+                console.assert(pieceGuard <= MAX_LEVEL_DEPTH * 2 + 1, 'a net has more pieces than levels');
+                const copy = { levelId: piece.levelId, from: piece.from, to: piece.to };
+                kept.push(copy);
+                if (!spots || piece.to.kind !== 'boundary') continue;
+
+                const spot = piece.levelId + '|' + piece.to.id;
+                const owner = spots[spot];
+                if (!owner) {
+                    spots[spot] = { key: net.key, piece: copy };
+                    continue;
+                }
+                // Both ends of the bus share the owner's port, so the owner
+                // marks its own piece too and the router knows it is a trunk.
+                owner.piece.portKey = owner.key;
+                copy.portKey = owner.key;
+                merges.push([net.key, owner.key]);
+                break;
+            }
+            out.push({ key: net.key, trunk: net.trunk, pieces: kept });
+        }
+
+        console.assert(out.length === nets.length, 'every net must come back');
+        return { nets: out, merges: merges };
     }
 
     return {
         buildLevelTree: buildLevelTree,
         decomposeNet: decomposeNet,
+        mergeTrunks: mergeTrunks,
         // Exposed for unit tests.
         _internal: {
             ancestryOf: ancestryOf,

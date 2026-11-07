@@ -4,6 +4,7 @@ Write a system diagram as text and get a schematic with clean, non-overlapping o
 
 <img src="assets/orca_flow_demo.png" width="600" alt="ORCA Flow demo">
 <img src="assets/flowschem-diagram.png" width="600" alt="Diagram rendered from a .flow file">
+<img src="assets/flowschem-complex.png" width="600" alt="A larger diagram with coloured traces, merged wires and dashed links">
 
 ## Run
 

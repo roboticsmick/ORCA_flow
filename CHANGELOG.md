@@ -1,6 +1,20 @@
 # Changelog
 
+## 2026-11-07
+
+### Changed
+
+- The README sample image `assets/flowschem-diagram.png` is re-rendered from the `demo` fixture with the current router.
+
+### Added
+
+- A second README sample, `assets/flowschem-complex.png`, rendered from the `fit-both` fixture to show coloured traces, merged wires and dashed links.
+
 ## 2026-11-06
+
+### Changed
+
+- Wires running one way to the same target, with the same line style, now merge as soon as they leave a shared box and carry on as one wire. In `filled-chamfer` the three wires into Teensy leave FORWARD as one, and crossings drop from 27 to 22.
 
 ### Added
 
@@ -10,6 +24,12 @@
 ### Fixed
 
 - Wires leaving a node through a box edge jogged sideways just below it, because the edge port aimed at the node's centre rather than the port the wire leaves by.
+- A box to box wire, such as `power <-> CORE`, sat between the wires to nodes on a box edge, so the four ESC wires jogged just inside AFT. It now sorts by where it carries on inside the box.
+- A section header such as `a-999999999` hung the preview. Rows above 256 are reported and skipped.
+- A section or segment named `constructor` or `__proto__` misresolved or crashed the preview.
+- More than 4096 connections crashed the preview. The rest are reported and skipped.
+- Where a merged wire sorted on a box edge depended on which of its wires was declared last. It now sorts by its first wire.
+- A box to box wire could pull its port to the far side of an invisible wrapper box. It now aims at where it comes from.
 
 ## 2026-11-05
 

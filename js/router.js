@@ -830,7 +830,10 @@
         const maxX = spec.bounds.maxX;
 
         // Index every node and remember which row band holds it.
-        const nodeIndex = {};
+        // WHY: node ids are user text, so ids such as __proto__ or toString
+        // reach here. On a plain object those hit the prototype, and only
+        // failed safe by luck. A null-prototype map holds only real nodes.
+        const nodeIndex = Object.create(null);
         rows.forEach((row, rowIdx) => {
             for (const node of row.nodes) {
                 assert(typeof node.centreX === 'number', 'node ' + node.id + ' has no centreX');
@@ -866,10 +869,16 @@
                 dashed: !!conn.dashed,
                 continuesFrom: !!conn.continuesFrom,
                 continuesTo: !!conn.continuesTo,
+                // Caller's trunk id: nets sharing one may bus onto a boundary.
+                trunk: typeof conn.trunk === 'string' && conn.trunk.length > 0 ? conn.trunk : null,
                 // Page X of the real endpoint inside a child box, in this
                 // section's space, when the caller knows it.
                 sourcePreferX: Number.isFinite(conn.sourcePreferX) ? conn.sourcePreferX : null,
                 targetPreferX: Number.isFinite(conn.targetPreferX) ? conn.targetPreferX : null,
+                // X that only orders a port with no preference among its
+                // neighbours, where the wire carries on inside a child box.
+                sourceOrderX: Number.isFinite(conn.sourceOrderX) ? conn.sourceOrderX : null,
+                targetOrderX: Number.isFinite(conn.targetOrderX) ? conn.targetOrderX : null,
                 // Caller's own wire identity, carried through untouched for colouring.
                 traceIndex: conn.traceIndex,
                 source: source.node,
@@ -893,11 +902,16 @@
         const buses = {};
         for (const net of nets) {
             if (net.type === 'bidirectional') continue;
-            // Wires reaching a box edge each continue somewhere different at
-            // the level above, or inside the box, so they must keep their own
-            // port and never merge into one bar.
-            if (net.target.boundary || net.continuesTo) continue;
-            const key = net.to + '|' + net.targetEdge;
+            // Wires reaching a box edge or entering a child box each continue
+            // somewhere different, so they keep their own port. The exception
+            // is a trunk, whose members the caller has proved share the rest
+            // of their path, so they meet on one boundary port as one bar.
+            if (net.continuesTo) continue;
+            if (net.target.boundary && !net.trunk) continue;
+            // WHY: boundary nets with no fixed port all share the one spanning
+            // boundary node, so keying by node alone would merge every wire
+            // leaving by that edge. The trunk id keeps distinct trunks apart.
+            const key = net.to + '|' + net.targetEdge + (net.target.boundary ? '|' + net.trunk : '');
             if (!buses[key]) {
                 buses[key] = { key: key, target: net.target, edge: net.targetEdge, members: [] };
             }
@@ -948,9 +962,16 @@
         }
 
         for (const net of nets) {
-            addAttachment(net.from, net.sourceEdge, 'out:' + net.id, net.target.centreX, net.sourcePreferX);
+            // WHY: an order X is meant only to sort a port among its group,
+            // but a wrapper places each port at its own aim, so on a wrapper
+            // the order X moved the port instead. Wrappers aim at far ends.
+            const outIdeal = net.sourceOrderX !== null && !net.source.passThrough
+                ? net.sourceOrderX : net.target.centreX;
+            const inIdeal = net.targetOrderX !== null && !net.target.passThrough
+                ? net.targetOrderX : net.source.centreX;
+            addAttachment(net.from, net.sourceEdge, 'out:' + net.id, outIdeal, net.sourcePreferX);
             const inKey = net.busKey ? 'bus:' + net.busKey : 'in:' + net.id;
-            addAttachment(net.to, net.targetEdge, inKey, net.source.centreX, net.targetPreferX);
+            addAttachment(net.to, net.targetEdge, inKey, inIdeal, net.targetPreferX);
         }
 
         const portX = {};  // "nodeId|edge|key" -> pixel X
@@ -1239,9 +1260,13 @@
             const finals = bus.members.map(net => net.runs[net.runs.length - 1]);
             const gapIdx = finals[0].gapIdx;
 
-            // Only runs landing in the same gap can share a track.
+            // Only runs landing in the same gap can share a track. The bus key
+            // pins the target node and edge, and so the final gap, so every
+            // member lands there. A silent skip here would leave the members
+            // marked as a bus with no bar, half merged, so it is an assertion.
             const sameGap = finals.filter(run => run.gapIdx === gapIdx);
-            if (sameGap.length < 2) continue;
+            assert(sameGap.length === finals.length && sameGap.length >= 2,
+                'bus ' + key + ' members must all end in one gap');
 
             const low = Math.min.apply(null, sameGap.map(r => r.low));
             const high = Math.max.apply(null, sameGap.map(r => r.high));
@@ -1256,6 +1281,7 @@
                 low: low,
                 high: high,
                 isBus: true,
+                toBoundary: !!bus.target.boundary,
                 members: sameGap,
                 ends: [].concat.apply([], sameGap.map(r => r.ends)),
                 dropX: bus.members[0].targetX,
@@ -1434,9 +1460,11 @@
          * @param {string} netId - Owning net or bus.
          * @param {Array} points - Ordered { x, y } points.
          * @param {boolean} dashed - Whether the wire is dashed.
+         * @param {boolean} endsAtTarget - False when the last point is on a
+         *                                bus bar rather than the target port.
          * @returns {void}
          */
-        function addPolyline(netId, points, dashed) {
+        function addPolyline(netId, points, dashed, endsAtTarget) {
             const kept = [];
             for (const point of points) {
                 const last = kept[kept.length - 1];
@@ -1447,7 +1475,7 @@
             }
             if (kept.length < 2) return;
 
-            polylines.push({ netId: netId, points: kept, dashed: dashed });
+            polylines.push({ netId: netId, points: kept, dashed: dashed, endsAtTarget: endsAtTarget });
             for (let i = 0; i + 1 < kept.length; i++) {
                 addSegment(netId, kept[i].x, kept[i].y, kept[i + 1].x, kept[i + 1].y, dashed);
             }
@@ -1497,6 +1525,7 @@
             // and vertical crossings, then drop into the target edge.
             const points = [{ x: net.sourceX, y: sourceY }];
             let joinsBus = false;
+            let reachesTarget = true;
 
             for (let i = 0; i < net.runs.length; i++) {
                 const run = net.runs[i];
@@ -1509,17 +1538,22 @@
                     // unless this member sits at one end of the bar, in which
                     // case it carries the bar on so the corner comes out round.
                     joinsBus = true;
+                    reachesTarget = false;
                     const ends = busEnds[run.busRun.busKey];
                     if (ends && !ends.farOwned && Math.abs(run.startX - ends.farEnd) < EPSILON) {
                         ends.farOwned = true;
+                        reachesTarget = true;
                         points.push({ x: ends.dropX, y: ends.y });
                         points.push({ x: ends.dropX, y: ends.targetY });
-                        arrows.push({
-                            netId: net.id,
-                            x: ends.dropX,
-                            y: ends.targetY,
-                            direction: ends.edge === 'top' ? 'down' : 'up'
-                        });
+                        // A trunk onto a box edge hands off, it does not arrive.
+                        if (!run.busRun.toBoundary) {
+                            arrows.push({
+                                netId: net.id,
+                                x: ends.dropX,
+                                y: ends.targetY,
+                                direction: ends.edge === 'top' ? 'down' : 'up'
+                            });
+                        }
                     } else if (ends && !ends.nearOwned
                         && Math.abs(run.startX - ends.nearEnd) < EPSILON
                         && Math.abs(ends.nearEnd - ends.dropX) > EPSILON) {
@@ -1545,7 +1579,7 @@
                 }
             }
 
-            addPolyline(net.id, points, dashed);
+            addPolyline(net.id, points, dashed, reachesTarget);
 
             if (net.type === 'bidirectional' && !net.source.boundary && !net.continuesFrom) {
                 arrows.push({
@@ -1570,6 +1604,8 @@
             const y = ends.y;
             const targetY = ends.targetY;
             const dropX = ends.dropX;
+            // A trunk keys its bus by dash style, so its bar keeps the style.
+            const busDashed = bus.members.every(member => member.dashed);
 
             // Whatever no end member took, the bus still has to draw. The far
             // leg carries the drop into the node, so it also carries the arrow.
@@ -1578,17 +1614,19 @@
                     { x: ends.farEnd, y: y },
                     { x: dropX, y: y },
                     { x: dropX, y: targetY }
-                ], false);
-                arrows.push({
-                    netId: busId,
-                    x: dropX,
-                    y: targetY,
-                    direction: bus.edge === 'top' ? 'down' : 'up'
-                });
+                ], busDashed, true);
+                if (!bus.target.boundary) {
+                    arrows.push({
+                        netId: busId,
+                        x: dropX,
+                        y: targetY,
+                        direction: bus.edge === 'top' ? 'down' : 'up'
+                    });
+                }
             }
 
             if (!ends.nearOwned && Math.abs(ends.nearEnd - dropX) > EPSILON) {
-                addPolyline(busId, [{ x: dropX, y: y }, { x: ends.nearEnd, y: y }], false);
+                addPolyline(busId, [{ x: dropX, y: y }, { x: ends.nearEnd, y: y }], busDashed, false);
             }
 
             // A dot marks a wire joining the middle of the bar. The drop point
