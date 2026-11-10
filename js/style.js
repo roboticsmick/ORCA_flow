@@ -27,6 +27,9 @@
     // =========================================================================
 
     /** Settings used when the `@style` pane leaves a key out. */
+    // WHY: section-padding, flow and node-min-height were accepted here long
+    // after anything read them, so typing them silently did nothing. Only keys
+    // the renderer reads belong in this list.
     const DEFAULT_STYLE = Object.freeze({
         'section-radius': 8,
         'section-border': 2,
@@ -39,17 +42,12 @@
         'hint-font': 'Roboto Mono',
         'hint-weight': 300,
         'hint-size': 11,
-        'section-padding': '20 16 20 16',
         'node-padding': '10 14 10 14',
-        'flow': 'down',
         'uppercase': true,
         'theme': 'engineering',
-        'line-theme': true,
-        'page-size': 'A4',
-        'page-orientation': 'landscape',
+        'line-theme': 'box',
         'page-margin': '10 10 10 10',
         'node-min-width': 120,
-        'node-min-height': 60,
         'node-uniform': true,
         'node-fill': false,
         'node-text-color': '#333333',
@@ -88,11 +86,10 @@
     );
 
     /** Settings holding 1, 2 or 4 space-separated numbers. */
-    const SPACING_KEYS = Object.freeze(['section-padding', 'node-padding', 'page-margin']);
+    const SPACING_KEYS = Object.freeze(['node-padding', 'page-margin']);
 
     /** Settings read by the renderer that have no default. */
-    const OPTIONAL_KEYS = Object.freeze(['line-spacing', 'corner-radius', 'line-palette',
-        'page-width', 'page-height']);
+    const OPTIONAL_KEYS = Object.freeze(['line-spacing', 'corner-radius', 'line-palette']);
 
     /** A font family name: letters, digits and single spaces, as Google Fonts uses. */
     const FONT_NAME = /^[A-Za-z0-9]+(?: [A-Za-z0-9]+){0,7}$/;
@@ -102,6 +99,12 @@
 
     /** Largest number any numeric setting accepts. */
     const MAX_NUMBER = 10000;
+
+    /** Settings with a tighter range than 0 to MAX_NUMBER, as [low, high]. */
+    const NUMBER_RANGES = Object.freeze({
+        'font-weight': [100, 900],
+        'hint-weight': [100, 900]
+    });
 
     // =========================================================================
     // 2. PARSING
@@ -208,10 +211,13 @@
             // to stay a string, so sizes came out NaN or as concatenated text,
             // and any string reaches SVG markup.
             const value = typeof style[key] === 'number' ? style[key] : parseFloat(style[key]);
-            if (Number.isFinite(value) && value >= 0 && value <= MAX_NUMBER) {
+            // WHY: font weights took any number up to 10000, so `font-weight: 5`
+            // passed and the browser silently drew its default weight instead.
+            const [low, high] = NUMBER_RANGES[key] || [0, MAX_NUMBER];
+            if (Number.isFinite(value) && value >= low && value <= high) {
                 style[key] = value;
             } else {
-                reject(style, errors, key, 'a number from 0 to ' + MAX_NUMBER);
+                reject(style, errors, key, 'a number from ' + low + ' to ' + high);
             }
         }
     }

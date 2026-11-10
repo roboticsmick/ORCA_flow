@@ -39,7 +39,6 @@ const Elements = {
     
     // Buttons
     btnGenerate: document.getElementById('btn-generate'),
-    btnExportPdf: document.getElementById('btn-export-pdf'),
     btnExportPng: document.getElementById('btn-export-png'),
     btnExportFlow: document.getElementById('btn-export-flow'),
     btnLoadFlow: document.getElementById('btn-load-flow'),
@@ -1098,6 +1097,104 @@ function nodeHeightForSection(sectionLayout, style) {
     return padding.top + textHeight + padding.bottom;
 }
 
+/** Width of one monospace character in em, used when no canvas can measure. */
+const MONO_EM_WIDTH = 0.6;
+
+/** Longest label measured, in characters, so a pasted wall of text stays bounded. */
+const MAX_LABEL_CHARS = 512;
+
+/** Canvas 2D context reused for every measurement, null until first asked for. */
+let MeasureContext = null;
+
+/**
+ * @brief Returns a canvas 2D context for text measurement, or false if none.
+ * @returns {Object|boolean} The context, or false outside a browser.
+ */
+function getMeasureContext() {
+    if (MeasureContext !== null) return MeasureContext;
+    MeasureContext = false;
+    try {
+        const canvas = document.createElement('canvas');
+        const context = canvas && typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null;
+        if (context && typeof context.measureText === 'function') MeasureContext = context;
+    } catch (error) {
+        MeasureContext = false;
+    }
+    return MeasureContext;
+}
+
+/**
+ * @brief Measures how wide one line of text draws, in pixels.
+ *
+ * Uses a canvas measureText in the browser. Where no canvas exists, or it
+ * returns no usable width, falls back to a monospace estimate of 0.6 em per
+ * character.
+ *
+ * @param {string} text - The line as drawn, already uppercased if it will be.
+ * @param {string} font - Font family name.
+ * @param {number} weight - Font weight, 100 to 900.
+ * @param {number} size - Font size in pixels.
+ * @returns {number} Width in pixels, zero or more.
+ */
+function measureLabelWidth(text, font, weight, size) {
+    console.assert(Number.isFinite(size) && size > 0, 'font size must be positive');
+    const line = String(text === undefined || text === null ? '' : text).substring(0, MAX_LABEL_CHARS);
+    const estimate = line.length * size * MONO_EM_WIDTH;
+    const context = getMeasureContext();
+    if (!context) return estimate;
+    context.font = weight + ' ' + size + "px '" + font + "', sans-serif";
+    const measured = context.measureText(line);
+    const width = measured ? measured.width : NaN;
+    return typeof width === 'number' && Number.isFinite(width) && width >= 0 ? width : estimate;
+}
+
+/**
+ * @brief Width a node box needs to hold its name and hint.
+ *
+ * The larger of node-min-width and the wider text line plus the left and right
+ * node-padding. The name is measured uppercased when the style draws it so.
+ *
+ * @param {Object} node - Node with name and optional hint.
+ * @param {Object} style - Style configuration.
+ * @returns {number} Width in pixels, at least node-min-width.
+ */
+function nodeWidthFor(node, style) {
+    console.assert(node && typeof node.name === 'string', 'a node needs a name');
+    const minWidth = style['node-min-width'] || 120;
+    const padding = parsePaddingValues(style['node-padding']);
+    const name = style.uppercase ? node.name.toUpperCase() : node.name;
+    const nameWidth = measureLabelWidth(name, style.font, style['font-weight'], style['font-size'] || 14);
+    const hintWidth = node.hint
+        ? measureLabelWidth(node.hint, style['hint-font'], style['hint-weight'], style['hint-size'] || 11)
+        : 0;
+    return Math.max(minWidth, Math.ceil(Math.max(nameWidth, hintWidth) + padding.left + padding.right));
+}
+
+/**
+ * @brief Picks each node's width in a section, honouring node-uniform.
+ *
+ * With node-uniform true every node takes the section's widest width, so
+ * the columns stay even. With it false each node keeps its own.
+ *
+ * @param {Object} sectionLayout - Layout with rows of nodes.
+ * @param {Object} style - Style configuration.
+ * @returns {Function} Maps a node to its width in pixels.
+ */
+function sectionNodeWidths(sectionLayout, style) {
+    console.assert(Array.isArray(sectionLayout.rows), 'a section layout needs rows');
+    const own = new Map();
+    let widest = 0;
+    for (const row of sectionLayout.rows) {
+        for (const node of row.nodes) {
+            const width = nodeWidthFor(node, style);
+            own.set(node, width);
+            widest = Math.max(widest, width);
+        }
+    }
+    const uniform = style['node-uniform'] !== false;
+    return node => (uniform ? widest : own.get(node));
+}
+
 /**
  * @brief Builds, or returns from cache, the routing plan for one section.
  *
@@ -1121,14 +1218,12 @@ function getSectionPlan(nodesData, sectionKey, style, uniformGapHeight = 0) {
     const sectionLayout = calculateSectionLayout(nodesData, sectionKey);
     if (!sectionLayout || sectionLayout.rows.length === 0) return null;
 
-    const nodeMinWidth = style['node-min-width'] || 120;
     const nodeHeight = nodeHeightForSection(sectionLayout, style);
+    const widthOf = sectionNodeWidths(sectionLayout, style);
 
-    const maxNodesInRow = Math.max(...sectionLayout.rows.map(r => r.nodes.length), 1);
-    let contentWidth = Math.max(
-        maxNodesInRow * (nodeMinWidth + NODE_COLUMN_SPACING),
-        MIN_SECTION_WIDTH
-    );
+    const rowWidths = sectionLayout.rows.map(row =>
+        row.nodes.reduce((sum, node) => sum + widthOf(node) + NODE_COLUMN_SPACING, 0));
+    let contentWidth = Math.max(...rowWidths, MIN_SECTION_WIDTH);
 
     const leaf = ActiveLevels ? ActiveLevels.tree.bySection[sectionKey] : null;
     const levelId = leaf ? leaf.id : null;
@@ -1141,10 +1236,10 @@ function getSectionPlan(nodesData, sectionKey, style, uniformGapHeight = 0) {
     function layoutRowsAt(width) {
         return sectionLayout.rows.map(row => ({
             nodes: row.nodes.map(node => {
-                node.pixelWidth = nodeMinWidth;
+                node.pixelWidth = widthOf(node);
                 node.pixelHeight = nodeHeight;
                 node.localX = node.column * width;
-                return { id: node.id, width: nodeMinWidth, centreX: node.localX };
+                return { id: node.id, width: node.pixelWidth, centreX: node.localX };
             })
         }));
     }
@@ -3370,44 +3465,6 @@ function renderGutter(box, style, themeColors) {
 }
 
 /**
- * Gets page dimensions from style configuration.
- * 
- * @param {Object} style - Style configuration.
- * @returns {Object} { width, height } in pixels.
- */
-function getPageDimensions(style) {
-    // Standard page sizes in mm
-    const pageSizes = {
-        'A4': { width: 297, height: 210 },
-        'A3': { width: 420, height: 297 },
-        'letter': { width: 279, height: 216 },
-        'legal': { width: 356, height: 216 }
-    };
-    
-    let dimensions = pageSizes[style['page-size']] || pageSizes['A4'];
-    
-    // Handle custom size
-    if (style['page-size'] === 'custom') {
-        dimensions = {
-            width: style['page-width'] || 297,
-            height: style['page-height'] || 210
-        };
-    }
-    
-    // Handle orientation
-    if (style['page-orientation'] === 'portrait') {
-        dimensions = { width: dimensions.height, height: dimensions.width };
-    }
-    
-    // Convert mm to pixels (assuming 96 DPI, 1mm ≈ 3.78px)
-    const mmToPx = 3.78;
-    return {
-        width: Math.round(dimensions.width * mmToPx),
-        height: Math.round(dimensions.height * mmToPx)
-    };
-}
-
-/**
  * Parses padding string into object.
  * 
  * @param {string} paddingStr - Padding string "top right bottom left".
@@ -3505,14 +3562,6 @@ async function exportPng() {
 }
 
 /**
- * Exports the current diagram as PDF.
- * Note: Basic implementation - for production, use a library like jsPDF.
- */
-function exportPdf() {
-    showModal('PDF export unavailable', 'PDF export needs the jsPDF library, which is not loaded. Use PNG export, or print to PDF from the browser.');
-}
-
-/**
  * Exports the current input as a .flow file.
  */
 function exportFlow() {
@@ -3566,6 +3615,31 @@ function loadFlow(file) {
 // 10. MAIN GENERATION FUNCTION
 // =============================================================================
 
+/** Longest wait for web fonts before laying out anyway, in milliseconds. */
+const FONT_LOAD_TIMEOUT_MS = 3000;
+
+/**
+ * @brief Waits until the label and hint fonts are loaded, or a timeout passes.
+ *
+ * Only fonts the page declares, through index.html, can load here. Any other
+ * family is measured with the browser's fallback.
+ *
+ * @param {Object} style - Checked style from parseStyle().
+ * @returns {Promise<void>} Resolves when loaded, failed or timed out.
+ */
+function loadStyleFonts(style) {
+    if (typeof document === 'undefined' || !document.fonts || typeof document.fonts.load !== 'function') {
+        return Promise.resolve();
+    }
+    const specs = [
+        style['font-weight'] + ' ' + style['font-size'] + "px '" + style.font + "'",
+        style['hint-weight'] + ' ' + style['hint-size'] + "px '" + style['hint-font'] + "'"
+    ];
+    const loads = Promise.all(specs.map(spec => Promise.resolve(document.fonts.load(spec)).catch(() => null)));
+    const timeout = new Promise(resolve => setTimeout(resolve, FONT_LOAD_TIMEOUT_MS));
+    return Promise.race([loads, timeout]).then(() => undefined);
+}
+
 /**
  * Generates the diagram preview from current inputs.
  */
@@ -3574,8 +3648,12 @@ function generatePreview() {
     Elements.btnGenerate.classList.add('generating');
 
     // Small delay for UI feedback
-    setTimeout(() => {
+    setTimeout(async () => {
         const parsedStyle = parseStyle(Elements.styleInput.value);
+        // WHY: node widths are measured on a canvas, which silently uses a
+        // fallback font until the web font has loaded, so a first render
+        // sized nodes for the wrong font and labels overran them.
+        await loadStyleFonts(parsedStyle.style);
         try {
             showPreview(parsedStyle.style, parsedStyle.errors);
         } catch (error) {
@@ -3612,7 +3690,6 @@ function showPreview(style, styleErrors) {
     Elements.previewPlaceholder.style.display = 'none';
     Elements.previewCanvas.style.display = 'block';
     Elements.previewCanvas.innerHTML = svg;
-    Elements.btnExportPdf.disabled = false;
     Elements.btnExportPng.disabled = false;
     AppState.diagramGenerated = true;
     zoomFit();
@@ -3769,7 +3846,6 @@ Elements.sectionHeaders.forEach(header => {
 
 // Button click handlers
 Elements.btnGenerate.addEventListener('click', generatePreview);
-Elements.btnExportPdf.addEventListener('click', exportPdf);
 Elements.btnExportPng.addEventListener('click', exportPng);
 Elements.btnExportFlow.addEventListener('click', exportFlow);
 

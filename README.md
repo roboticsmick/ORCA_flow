@@ -3,7 +3,6 @@
 Write a system diagram as text and get a schematic with clean, non-overlapping orthogonal wires.
 
 <img src="assets/orca_flow_demo.png" width="600" alt="ORCA Flow demo">
-<img src="assets/flowschem-diagram.png" width="600" alt="Diagram rendered from a .flow file">
 <img src="assets/flowschem-complex.png" width="600" alt="A larger diagram with coloured traces, merged wires and dashed links">
 
 ## Run
@@ -18,7 +17,7 @@ Open `http://localhost:8000`, fill in the three panes on the left, then press **
 
 | Control | What it does |
 | --- | --- |
-| **Generate Preview**, `Ctrl+Enter` | Draws the diagram. Unresolved names are listed in a popup. |
+| **Generate Preview**, `Ctrl+Enter` | Draws the diagram. Any problems found, such as unresolved names, rejected settings or skipped rows, are listed in a popup. |
 | **Export PNG** | Saves the diagram as a PNG. |
 | **Export .flow** | Saves the three panes as one `.flow` file. |
 | **Load .flow** | Opens a `.flow` file. |
@@ -65,7 +64,8 @@ USV <> ground
 | `[a][b]` | `@layout` | Puts sections `a` and `b` side by side. |
 | `[a]/[b]` | `@layout` | Puts `a` above `b`. |
 | `[Name[a][b]]` | `@layout` | Draws a box called `Name` around `a` and `b`. |
-| `sensors-1` | `@nodes` | Starts row 1 of section `sensors`. Lines below it go on that row. |
+| `sensors-1` | `@nodes` | Starts row 1 of section `sensors`. Lines below it go on that row. Rows run from 1 to 256. |
+| `USV:sensors-1` | `@nodes` | Starts a row of the `sensors` section inside box `USV`. Needed when two boxes each hold a section with the same name, as in `[USV[sensors]][ROV[sensors]]`. |
 | `Teensy` | `@nodes` | Places a node on the current row with no new links. Every node needs a row, so list each target under a later row. |
 | `Name/hint` | `@nodes` | Adds a smaller second line to a node. Works on either mention. |
 | `A > B` | `@nodes` | Wire with an arrow from `A` to `B`. |
@@ -77,15 +77,17 @@ USV <> ground
 | `USV <> ground` | `@nodes` | Links two boxes or sections by name. |
 | `links-1` | `@nodes` | A section the layout never draws, used to hold cross-section links. |
 | `B {#e6194b}` | `@nodes` | Colours that wire's whole trace. Goes after a target. Accepts `#rgb` and `#rrggbb` only. |
-| `# text` | any pane | A comment. |
+| `# text` | any pane | A comment. It must start the line, since `#` inside a node line is part of the name. |
 
 - A directional line (`>`, `<`, `->`, `<-`) creates and links nodes inside its own section only.
 - A two-way line (`<>`, `<->`) links nodes that already exist, in any section, and creates nothing.
 - A trace is one wire across every box it crosses, plus any wires sharing its bus. A trace has one colour.
+- One-way wires to the same target with the same line style merge into one wire once they leave a shared box.
+- A diagram holds up to 4096 connections. Any beyond that are reported and skipped.
 
 ## Settings
 
-Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px`, and only the number is used.
+Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px`, and only the number is used. A misspelled key or an out of range value is reported and its default used.
 
 | Setting | Range | Default | What it does |
 | --- | --- | --- | --- |
@@ -99,7 +101,8 @@ Write these in `@style` as `key: value`. Numbers may carry a unit, such as `14px
 | `hint-weight` | 100 to 900 | `300` | Hint line weight. |
 | `hint-size` | 0 to 10000 | `11` | Hint line size in px. |
 | `uppercase` | `true`, `false` | `true` | Shows node and box labels in capitals. |
-| `node-min-width` | 0 to 10000 | `120` | Node width in px. |
+| `node-min-width` | 0 to 10000 | `120` | Narrowest node width in px. A node grows past it to fit its name or hint plus `node-padding`. |
+| `node-uniform` | `true`, `false` | `true` | `true` gives every node in a box the width of its widest node. `false` sizes each node to its own text. |
 | `node-padding` | 1, 2 or 4 numbers | `10 14 10 14` | Space inside a node in px, top right bottom left. |
 | `node-radius` | 0 to 10000 | `6` | Node corner radius in px. |
 | `node-border` | 0 to 10000 | `2` | Node outline width in px. |

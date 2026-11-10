@@ -1,10 +1,39 @@
 # Changelog
 
+## 2026-11-09
+
+### Removed
+
+- The `section-padding`, `flow` and `node-min-height` settings, which nothing read. Writing them now reports them as not a setting, and the diagram is unchanged.
+
+### Fixed
+
+- The example in the empty style pane no longer shows the removed `page-size` and `page-orientation` settings or the dead keys, and shows `line-theme: box`.
+
+## 2026-11-08
+
+### Changed
+
+- A node grows wider than `node-min-width` to fit its name or hint plus `node-padding`, so no label overruns its box. `node-uniform` now works: `true`, the default, gives every node in a box its widest width, `false` sizes each node on its own.
+- The preview waits up to 3 seconds for the label fonts before laying out, so node widths are measured in the real font.
+
 ## 2026-11-07
 
 ### Changed
 
-- The README sample image `assets/flowschem-diagram.png` is re-rendered from the `demo` fixture with the current router.
+- `assets/flowschem-diagram.png` is re-rendered from the `demo` fixture with the current router. The README no longer shows it.
+- The README app screenshot `assets/orca_flow_demo.png` is retaken with the current router.
+- `line-theme` defaults to `box`, matching the README. `true` still means `box`.
+- The README now covers `Parent:section-N` row headers, the row and connection limits, wire merging and where a `#` comment may go.
+
+### Removed
+
+- The Export PDF button, which only ever showed an "unavailable" message. Use Export PNG, or print to PDF from the browser.
+- The `page-size`, `page-orientation`, `page-width` and `page-height` settings, which nothing read. They are now reported as unknown keys.
+
+### Fixed
+
+- `font-weight` and `hint-weight` took any number up to 10000, so a typo such as `5` was silently drawn at the browser default. They now accept 100 to 900 and report anything else.
 
 ### Added
 
